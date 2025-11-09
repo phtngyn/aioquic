@@ -36,20 +36,20 @@ def demo_basic_encoding():
     logger.info("Original message: %s", message.payload.decode())
     logger.info("Sequence number: %d", message.sequence_number)
 
-    # Encode to CIDs
+    # Encode to CIDs (let it auto-detect compression)
     from aioquic.covert.core.enums import CompressionType
 
-    cids = encoder.encode_message_to_cids(message, key, CompressionType.NONE)
+    cids = encoder.encode_message_to_cids(message, key, CompressionType.ZSTD)
     logger.info("Encoded into %d CIDs:", len(cids))
     for i, cid in enumerate(cids):
         logger.info("  CID %d: %s (length=%d)", i, cid.hex(), len(cid))
 
-    # Decode from CIDs
+    # Decode from CIDs (compression auto-detected from header)
     buffer = CIDBuffer()
     for cid in cids:
         buffer.add_cid(cid)
 
-    result = buffer.try_decode(encoder, key, CompressionType.NONE)
+    result = buffer.try_decode(encoder, key)  # No compression arg needed!
     if result:
         decoded, cids_used = result
         logger.info("Decoded message: %s", decoded.payload.decode())
@@ -129,21 +129,75 @@ def demo_encryption():
     from aioquic.covert.core.enums import CompressionType
 
     message = sync.prepare_message(CovertMessageType.TEXT, plaintext)
-    cids = encoder.encode_message_to_cids(message, alice_key, CompressionType.NONE)
+    cids = encoder.encode_message_to_cids(message, alice_key, CompressionType.ZSTD)
     logger.info("Encrypted into %d CIDs", len(cids))
 
-    # Bob receives and decrypts
+    # Bob receives and decrypts (compression auto-detected)
     buffer = CIDBuffer()
     for cid in cids:
         buffer.add_cid(cid)
 
-    result = buffer.try_decode(encoder, bob_key, CompressionType.NONE)
+    result = buffer.try_decode(encoder, bob_key)  # No compression arg needed!
     if result:
         decoded, _ = result
         logger.info("Bob decrypted: %s", decoded.payload.decode())
         logger.info("✓ SUCCESS: Secure communication established!")
     else:
         logger.error("✗ FAILED: Decryption failed")
+
+    print()
+
+
+def demo_compression():
+    """Demo: Compression effectiveness"""
+    logger.info("=" * 60)
+    logger.info("Demo 4: Compression")
+    logger.info("=" * 60)
+
+    encoder = CIDEncoder(chunk_size=16)
+    sync = Synchronizer(window_size=16)
+    key = b"1" * 32
+
+    # Highly compressible data
+    plaintext = b"A" * 500  # 500 bytes of same character
+    logger.info("Original size: %d bytes (highly repetitive)", len(plaintext))
+
+    from aioquic.covert.core.enums import CompressionType
+
+    # Without compression
+    msg1 = sync.prepare_message(CovertMessageType.TEXT, plaintext)
+    cids_none = encoder.encode_message_to_cids(msg1, key, CompressionType.NONE)
+    logger.info("Without compression: %d CIDs", len(cids_none))
+
+    # With zstd compression
+    msg2 = sync.prepare_message(CovertMessageType.TEXT, plaintext)
+    cids_zstd = encoder.encode_message_to_cids(msg2, key, CompressionType.ZSTD)
+    logger.info("With ZSTD compression: %d CIDs", len(cids_zstd))
+
+    # Decode both
+    buffer1 = CIDBuffer()
+    for cid in cids_none:
+        buffer1.add_cid(cid)
+    result1 = buffer1.try_decode(encoder, key)
+
+    buffer2 = CIDBuffer()
+    for cid in cids_zstd:
+        buffer2.add_cid(cid)
+    result2 = buffer2.try_decode(encoder, key)
+
+    if result1 and result2:
+        decoded1, _ = result1
+        decoded2, _ = result2
+        if decoded1.payload == decoded2.payload == plaintext:
+            savings = ((len(cids_none) - len(cids_zstd)) / len(cids_none)) * 100
+            logger.info(
+                "✓ SUCCESS: Both decoded correctly! Compression saved %.1f%% CIDs",
+                savings,
+            )
+        else:
+            logger.error("✗ FAILED: Decoded data mismatch")
+    else:
+        logger.error("✗ FAILED: Decoding failed")
 
     print()
 
@@ -229,6 +283,7 @@ def main():
         demo_basic_encoding()
         demo_key_exchange()
         demo_encryption()
+        demo_compression()
         demo_sliding_window()
         demo_stealth()
 

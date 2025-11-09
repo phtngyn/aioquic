@@ -74,6 +74,11 @@ class CIDEncoder:
             actual_compression.name,
         )
 
+        # Prepend compression flag (1 byte) to payload
+        # This allows decoder to know which decompression to use
+        compression_flag = bytes([actual_compression.value])
+        encrypted_payload = compression_flag + encrypted_payload
+
         # Split into chunks
         payload_chunks = chunks(encrypted_payload, self.chunk_size)
 
@@ -118,7 +123,7 @@ class CIDEncoder:
         Args:
             cids: List of CID bytes
             encryption_key: Decryption key
-            compression_type: Compression algorithm used
+            compression_type: IGNORED - actual compression read from payload header
 
         Returns:
             Decoded message or None if decoding fails
@@ -130,13 +135,35 @@ class CIDEncoder:
             # Reconstruct encrypted payload
             encrypted_payload = self._reconstruct_payload(cids)
 
-            # Decrypt
+            # Extract compression flag (first byte)
+            if len(encrypted_payload) < 1:
+                logger.debug("Payload too short to contain compression flag")
+                return None
+
+            compression_flag = encrypted_payload[0]
+            encrypted_data = encrypted_payload[1:]
+
+            # Determine actual compression used
+            try:
+                actual_compression = CompressionType(compression_flag)
+            except ValueError:
+                logger.debug("Invalid compression flag: %d", compression_flag)
+                actual_compression = CompressionType.NONE
+
+            logger.debug(
+                "Reconstructed %d bytes from %d CIDs (compression: %s)",
+                len(encrypted_data),
+                len(cids),
+                actual_compression.name,
+            )
+
+            # Decrypt with actual compression
             from ..crypto.cipher import decrypt_message
 
             decrypted_bytes = decrypt_message(
-                encrypted_payload,
+                encrypted_data,
                 encryption_key,
-                compression_type=compression_type,
+                compression_type=actual_compression,
             )
 
             # Deserialize message
