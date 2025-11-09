@@ -12,6 +12,7 @@ from ..crypto.exchange import KeyExchange
 from ..crypto.keys import KeyManager
 from ..protocol.encoder import CIDBuffer, CIDEncoder
 from ..protocol.synchronizer import Synchronizer
+from ..utils.stealth import StealthManager
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,15 @@ class SessionManager:
 
         # Message queues (peer_ip -> list of CIDs to send)
         self._outgoing_cids: Dict[str, List[bytes]] = {}
+
+        # Stealth manager for anti-detection
+        self.stealth = StealthManager(
+            enable_timing_randomization=config.enable_timing_randomization,
+            enable_entropy_mixing=True,
+            enable_traffic_mimicry=config.enable_traffic_mimicry,
+            timing_jitter_ms=config.timing_jitter_ms,
+            decoy_ratio=config.decoy_traffic_ratio,
+        )
 
         logger.info(
             "SessionManager initialized (client=%s, key_type=%s)",
@@ -190,6 +200,13 @@ class SessionManager:
         Returns:
             Next CID to send, or None if queue is empty
         """
+        # Apply timing randomization
+        self.stealth.apply_timing_delay()
+
+        # Maybe send decoy
+        if self.stealth.should_send_decoy():
+            return self.stealth.generate_decoy_cid()
+
         with self._lock:
             if peer_address not in self._outgoing_cids:
                 return None

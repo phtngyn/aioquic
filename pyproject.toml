@@ -30,6 +30,7 @@ dependencies = [
     "cryptography>=42.0.0",
     "pylsqpack>=0.3.3,<0.4.0",
     "pyopenssl>=24",
+    "pytest>=9.0.0",
     "service-identity>=24.1.0",
     "zstandard>=0.22.0",
 ]

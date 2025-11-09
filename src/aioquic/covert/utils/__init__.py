@@ -3,6 +3,29 @@
 import secrets
 from typing import List
 
+from .stealth import (
+    EntropyMixer,
+    RSAModulusPadding,
+    StatisticalUniformity,
+    StealthManager,
+    TimingObfuscator,
+    TrafficMimicry,
+)
+
+__all__ = [
+    "generate_ordered_bytes",
+    "chunks",
+    "xor_bytes",
+    "pad_to_length",
+    "entropy_mix",
+    "TimingObfuscator",
+    "EntropyMixer",
+    "RSAModulusPadding",
+    "TrafficMimicry",
+    "StatisticalUniformity",
+    "StealthManager",
+]
+
 
 def generate_ordered_bytes(n: int, size: int = 4) -> List[bytes]:
     """Generate list of high-entropy ordered bytes
