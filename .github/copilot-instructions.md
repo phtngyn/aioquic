@@ -1,3 +1,3 @@
 - Be extremely consise and sacrifice grammar for the sake of concision.
 - Autosave with trigger linting by ruff.
-- Dont generate markdown file
+- Do not generate summary markdown file
