@@ -1,6 +1,5 @@
 """State management for covert channel sessions"""
 
-from ..core.config import CovertConfig
-from ..core.types import CovertSession
+from .manager import SessionManager
 
 __all__ = ["SessionManager"]

@@ -161,6 +161,9 @@ class CovertSession:
     last_activity: float = field(default_factory=lambda: datetime.now().timestamp())
     created_at: float = field(default_factory=lambda: datetime.now().timestamp())
 
+    # Protocol components (stored as metadata to avoid circular imports)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
     def next_send_sequence(self) -> int:
         """Get next sequence number for sending"""
         seq = self.send_sequence
