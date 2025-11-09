@@ -5,7 +5,6 @@ import zlib
 from typing import Optional, Tuple
 
 import zstandard as zstd
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 
 from ..core.enums import CompressionType
 
@@ -34,21 +33,13 @@ class CipherSuite:
         Returns:
             nonce (12 bytes) + ciphertext + tag (16 bytes)
         """
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
         if nonce is None:
             nonce = secrets.token_bytes(12)
         elif len(nonce) != 12:
             msg = "Nonce must be 12 bytes"
             raise ValueError(msg)
-
-        cipher = Cipher(
-            algorithms.ChaCha20(self.encryption_key, nonce),
-            mode=None,
-        )
-        encryptor = cipher.encryptor()
-        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-
-        # ChaCha20-Poly1305: nonce + ciphertext + tag
-        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
         aead = ChaCha20Poly1305(self.encryption_key)
         encrypted = aead.encrypt(nonce, plaintext, None)

@@ -1,6 +1,5 @@
 """Key management for covert channel cryptography"""
 
-import secrets
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -131,7 +130,7 @@ class KeyManager:
         """Derive encryption, MAC, and nonce keys from shared secret
 
         Args:
-            salt: Optional salt for HKDF
+            salt: Optional salt for HKDF (if None, uses fixed derivation)
 
         Returns:
             Tuple of (encryption_key, mac_key, nonce_key)
@@ -140,8 +139,9 @@ class KeyManager:
             msg = "Shared secret not established"
             raise ValueError(msg)
 
+        # Use fixed salt if not provided for deterministic key derivation
         if salt is None:
-            salt = secrets.token_bytes(32)
+            salt = b"covert-channel-salt"
 
         # Derive 96 bytes total: 32 for encryption, 32 for MAC, 32 for nonce
         hkdf = HKDF(

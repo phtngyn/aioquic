@@ -100,8 +100,10 @@ class CIDEncoder:
             cid = order_bytes[i] + padded_chunk
             cids.append(cid)
 
-        # Shuffle to avoid predictable patterns
-        secrets.SystemRandom().shuffle(cids)
+        # Don't shuffle if ordering is enabled - defeats the purpose!
+        # Shuffle only in simple mode for stealth
+        if not self.use_ordering:
+            secrets.SystemRandom().shuffle(cids)
 
         return cids
 
