@@ -120,6 +120,21 @@ class QuicConfiguration:
     )
     verify_mode: Optional[int] = None
 
+    # Covert channel support
+    covert_channel_enabled: bool = False
+    """
+    Enable covert channel functionality.
+
+    When enabled, connection IDs can carry encrypted covert messages.
+    """
+
+    covert_config: Optional[Any] = None
+    """
+    Covert channel configuration (CovertConfig instance).
+
+    If None and covert_channel_enabled=True, default config will be used.
+    """
+
     def load_cert_chain(
         self,
         certfile: Union[str, PathLike],
