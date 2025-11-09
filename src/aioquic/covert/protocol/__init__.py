@@ -1,7 +1,6 @@
 """Protocol handler for covert channel"""
 
-from ..core.config import CovertConfig
-from ..core.enums import CovertMessageType
-from ..core.types import CovertMessage, CovertSession
+from .encoder import CIDBuffer, CIDEncoder
+from .synchronizer import Synchronizer
 
-__all__ = ["CovertProtocol"]
+__all__ = ["Synchronizer", "CIDEncoder", "CIDBuffer"]
