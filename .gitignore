@@ -4,10 +4,10 @@
 .coverage
 .eggs
 .mypy_cache
-.vscode
 /build
 /dist
 /docs/_build
+__pycache__
 
 # Environments
 .env
