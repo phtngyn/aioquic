@@ -23,6 +23,9 @@ from ..buffer import (
     BufferReadError,
     size_uint_var,
 )
+from ..covert.core.config import CovertConfig
+from ..covert.core.enums import CovertMessageType
+from ..covert.state.manager import SessionManager
 from . import events
 from .configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
 from .congestion.base import K_GRANULARITY
@@ -310,7 +313,8 @@ class QuicConnection:
         self.host_cid = self._host_cids[0].cid
         self._host_cid_seq = 1
         self._local_ack_delay_exponent = 3
-        self._local_active_connection_id_limit = 8
+        # Higher limit for covert channel CID rotation
+        self._local_active_connection_id_limit = 32 if configuration.covert_channel_enabled else 8
         self._local_challenges: dict[bytes, QuicNetworkPath] = {}
         self._local_initial_source_connection_id = self._host_cids[0].cid
         self._local_max_data = Limit(
@@ -451,6 +455,16 @@ class QuicConnection:
             0x31: (self._handle_datagram_frame, EPOCHS("01")),
         }
 
+        # covert channel
+        self._covert_enabled = configuration.covert_channel_enabled
+        self._covert_manager: Optional[SessionManager] = None
+        if self._covert_enabled:
+            config = configuration.covert_config or CovertConfig()
+            self._covert_manager = SessionManager(
+                config=config, is_client=self._is_client
+            )
+            self._logger.info("Covert channel enabled (client=%s)", self._is_client)
+
     @property
     def configuration(self) -> QuicConfiguration:
         return self._configuration
@@ -589,6 +603,13 @@ class QuicConnection:
                 builder.max_total_bytes = (
                     network_path.bytes_received * 3 - network_path.bytes_sent
                 )
+                if self._covert_enabled:
+                    self._logger.warning(
+                        "Network path not validated: max_total_bytes=%d (received=%d, sent=%d)",
+                        builder.max_total_bytes,
+                        network_path.bytes_received,
+                        network_path.bytes_sent
+                    )
 
             try:
                 if not self._handshake_confirmed:
@@ -646,6 +667,9 @@ class QuicConnection:
             payload_length = len(datagram)
             network_path.bytes_sent += payload_length
             ret.append((datagram, network_path.addr))
+        
+        if datagrams and self._covert_enabled:
+            self._logger.debug("Returning %d datagrams to send", len(datagrams))
 
             if self._quic_logger is not None:
                 self._quic_logger.log_event(
@@ -1122,6 +1146,42 @@ class QuicConnection:
         :param data: The data to be sent.
         """
         self._datagrams_pending.append(data)
+
+    def covert_send_message(self, peer_address: str, message: str) -> bool:
+        """
+        Send text message via covert channel.
+
+        .. aioquic_transmit::
+
+        :param peer_address: Peer IP address
+        :param message: Text message to send
+        :return: True if queued successfully
+        """
+        if not self._covert_enabled or not self._covert_manager:
+            self._logger.warning("Covert channel not enabled")
+            return False
+
+        payload = message.encode("utf-8")
+        success = self._covert_manager.queue_message(
+            peer_address, CovertMessageType.TEXT, payload
+        )
+        
+        # Force CID generation to transmit covert message
+        if success:
+            self._replenish_connection_ids(peer_address)
+        
+        return success
+
+    def covert_get_stats(self, peer_address: str) -> Optional[dict]:
+        """
+        Get covert channel statistics.
+
+        :param peer_address: Peer IP address
+        :return: Statistics dictionary or None
+        """
+        if not self._covert_enabled or not self._covert_manager:
+            return None
+        return self._covert_manager.get_session_stats(peer_address)
 
     def send_stream_data(
         self, stream_id: int, data: bytes, end_stream: bool = False
@@ -1674,7 +1734,12 @@ class QuicConnection:
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
 
-                self._replenish_connection_ids()
+                # Get peer address from first network path
+                peer_addr = None
+                if self._network_paths:
+                    peer_addr = self._network_paths[0].addr[0]
+
+                self._replenish_connection_ids(peer_addr)
                 self._events.append(
                     events.HandshakeCompleted(
                         alpn_protocol=self.tls.alpn_negotiated,
@@ -1901,6 +1966,37 @@ class QuicConnection:
                 frame_type=frame_type,
                 reason_phrase="Length must be greater than 0 and less than 20",
             )
+
+        # covert channel: extract message from CID
+        self._logger.info("NEW_CONNECTION_ID frame received (seq=%d, cid=%s)", sequence_number, connection_id.hex())
+        if self._covert_enabled and self._covert_manager:
+            peer_addr = context.network_path.addr[0] if context.network_path else None
+            self._logger.info("Covert enabled: peer_addr=%s, network_path=%s", peer_addr, context.network_path)
+            if peer_addr:
+                self._logger.info("Received NEW_CONNECTION_ID from %s: %s", peer_addr, connection_id.hex())
+                try:
+                    messages = self._covert_manager.handle_received_cid(
+                        peer_addr, connection_id
+                    )
+                    self._logger.info("Extracted %d messages from CID", len(messages))
+                    for msg in messages:
+                        if msg.message_type == CovertMessageType.TEXT:
+                            text = msg.payload.decode("utf-8", errors="replace")
+                            self._logger.info(
+                                "Covert message from %s: %s", peer_addr, text
+                            )
+                            # Emit event for application layer
+                            self._events.append(
+                                events.CovertMessageReceived(
+                                    peer_address=peer_addr,
+                                    payload=msg.payload,
+                                )
+                            )
+                except Exception as e:
+                    self._logger.error("Covert extraction failed: %s", e)
+                
+                # Replenish CIDs after processing to create feedback loop (like original QuiCC)
+                self._replenish_connection_ids(peer_addr)
 
         # log frame
         if self._quic_logger is not None:
@@ -2183,7 +2279,8 @@ class QuicConnection:
                 break
 
         # issue a new connection ID
-        self._replenish_connection_ids()
+        peer_addr = context.network_path.addr[0] if context.network_path else None
+        self._replenish_connection_ids(peer_addr)
 
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2642,14 +2739,57 @@ class QuicConnection:
                     },
                 )
 
-    def _replenish_connection_ids(self) -> None:
+    def _replenish_connection_ids(self, peer_address: Optional[str] = None) -> None:
         """
         Generate new connection IDs.
         """
-        while len(self._host_cids) < min(8, self._remote_active_connection_id_limit):
+        # Use higher limit for covert channel
+        max_cids = min(self._local_active_connection_id_limit, self._remote_active_connection_id_limit)
+        
+        # For covert channel: make room if we have pending messages (feedback loop)
+        if (
+            self._covert_enabled
+            and self._covert_manager
+            and peer_address
+            and len(self._host_cids) >= max_cids
+            and self._covert_manager.has_pending_messages(peer_address)
+        ):
+            # Remove old sent CIDs (keep last 4 for safety)
+            sent_cids = [cid for cid in self._host_cids if cid.was_sent]
+            if len(sent_cids) > 4:
+                cids_to_remove = sent_cids[:-4]
+                for old_cid in cids_to_remove:
+                    self._host_cids.remove(old_cid)
+                self._logger.info(
+                    "Replenish: Removed %d old CIDs, now have %d",
+                    len(cids_to_remove),
+                    len(self._host_cids),
+                )
+        
+        self._logger.info(
+            "Replenish CIDs: current=%d, max=%d, peer=%s",
+            len(self._host_cids),
+            max_cids,
+            peer_address,
+        )
+        
+        while len(self._host_cids) < max_cids:
+            # Try covert CID first
+            covert_cid = None
+            if self._covert_enabled and self._covert_manager and peer_address:
+                covert_cid = self._covert_manager.get_next_cid(peer_address)
+                if covert_cid:
+                    self._logger.info("Got covert CID for %s", peer_address)
+
+            cid = (
+                covert_cid
+                if covert_cid
+                else os.urandom(self._configuration.connection_id_length)
+            )
+
             self._host_cids.append(
                 QuicConnectionId(
-                    cid=os.urandom(self._configuration.connection_id_length),
+                    cid=cid,
                     sequence_number=self._host_cid_seq,
                     stateless_reset_token=os.urandom(16),
                 )
@@ -3010,10 +3150,16 @@ class QuicConnection:
         else:
             return
         space = self._spaces[tls.Epoch.ONE_RTT]
+        
+        if self._covert_enabled:
+            unsent = [cid for cid in self._host_cids if not cid.was_sent]
+            if unsent:
+                self._logger.info("_write_application: %d unsent CIDs available", len(unsent))
 
         while True:
-            # apply pacing, except if we have ACKs to send
-            if space.ack_at is None or space.ack_at >= now:
+            # apply pacing, except if we have ACKs to send or covert CIDs to send
+            has_unsent_cids = self._covert_enabled and any(not cid.was_sent for cid in self._host_cids)
+            if (space.ack_at is None or space.ack_at >= now) and not has_unsent_cids:
                 self._pacing_at = self._loss._pacer.next_send_time(now=now)
                 if self._pacing_at is not None:
                     break
@@ -3048,11 +3194,38 @@ class QuicConnection:
                     network_path.remote_challenges.popleft()
 
                 # NEW_CONNECTION_ID
+                unsent_cids = [cid for cid in self._host_cids if not cid.was_sent]
+                if unsent_cids:
+                    self._logger.info("Writing %d NEW_CONNECTION_ID frames (buffer capacity: %d)", len(unsent_cids), builder.remaining_flight_space)
                 for connection_id in self._host_cids:
                     if not connection_id.was_sent:
                         self._write_new_connection_id_frame(
                             builder=builder, connection_id=connection_id
                         )
+                if unsent_cids:
+                    self._logger.info("Wrote %d NEW_CONNECTION_ID frames (remaining capacity: %d)", len(unsent_cids), builder.remaining_flight_space)
+                
+                # For covert channel: clean old CIDs and replenish when messages pending
+                peer_addr = network_path.addr[0] if network_path else None
+                if (
+                    self._covert_enabled
+                    and self._covert_manager
+                    and peer_addr
+                    and self._covert_manager.has_pending_messages(peer_addr)
+                ):
+                    # Remove old sent CIDs (keep last 4 for safety)
+                    sent_cids = [cid for cid in self._host_cids if cid.was_sent]
+                    if len(sent_cids) > 4:
+                        cids_to_remove = sent_cids[:-4]  # Keep last 4
+                        for old_cid in cids_to_remove:
+                            self._host_cids.remove(old_cid)
+                        self._logger.info(
+                            "Removed %d old CIDs, now have %d",
+                            len(cids_to_remove),
+                            len(self._host_cids),
+                        )
+                    # Generate more CIDs
+                    self._replenish_connection_ids(peer_addr)
 
                 # RETIRE_CONNECTION_ID
                 for sequence_number in self._retire_connection_ids[:]:

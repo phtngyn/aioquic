@@ -124,3 +124,17 @@ class StreamReset(QuicEvent):
 
     stream_id: int
     "The ID of the stream that was reset."
+
+
+@dataclass
+class CovertMessageReceived(QuicEvent):
+    """
+    The CovertMessageReceived event is fired when a covert channel message
+    is extracted from QUIC Connection IDs.
+    """
+
+    peer_address: str
+    "The address of the peer who sent the message."
+
+    payload: bytes
+    "The decrypted message payload."

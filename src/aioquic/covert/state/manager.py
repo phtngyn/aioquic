@@ -138,17 +138,25 @@ class SessionManager:
         with self._lock:
             session = self.get_or_create_session(peer_address)
 
-            # Check if session is ready
-            if session.state not in (
-                CovertState.READY,
-                CovertState.KEY_EXCHANGE_COMPLETE,
-            ):
+            # Check if session is ready (allow IDLE after key exchange)
+            if session.state == CovertState.CLOSED:
                 logger.warning(
-                    "Cannot queue message for %s: session not ready (state=%s)",
+                    "Cannot queue message for %s: session closed",
                     peer_address,
-                    session.state.value,
                 )
                 return False
+            
+            # If IDLE, perform key exchange first
+            if session.state == CovertState.IDLE:
+                key_exchange = session.metadata.get("key_exchange")
+                if key_exchange:
+                    session.state = CovertState.KEY_EXCHANGE_COMPLETE
+                else:
+                    logger.warning(
+                        "Cannot queue message for %s: no key exchange available",
+                        peer_address,
+                    )
+                    return False
 
             # Get components
             synchronizer = session.metadata["synchronizer"]
@@ -177,11 +185,12 @@ class SessionManager:
                 session.bytes_sent += len(payload)
                 session.update_activity()
 
-                logger.debug(
-                    "Queued message for %s: %d bytes -> %d CIDs",
+                logger.info(
+                    "Queued message for %s: %d bytes -> %d CIDs (total queued: %d)",
                     peer_address,
                     len(payload),
                     len(cids),
+                    len(self._outgoing_cids[peer_address]),
                 )
 
                 return True
@@ -209,10 +218,12 @@ class SessionManager:
 
         with self._lock:
             if peer_address not in self._outgoing_cids:
+                logger.debug("No outgoing CID queue for %s", peer_address)
                 return None
 
             queue = self._outgoing_cids[peer_address]
             if not queue:
+                logger.debug("Outgoing CID queue empty for %s", peer_address)
                 # Check for retransmissions or keep-alive
                 session = self._sessions.get(peer_address)
                 if session:
@@ -220,7 +231,9 @@ class SessionManager:
                 return None
 
             # Pop next CID from queue
-            return queue.pop(0)
+            cid = queue.pop(0)
+            logger.info("Popped CID for %s (remaining: %d)", peer_address, len(queue))
+            return cid
 
     def _get_control_cid(self, session: CovertSession) -> Optional[bytes]:
         """Get control CID (retransmission, ACK, keep-alive)
@@ -326,9 +339,11 @@ class SessionManager:
         key_exchange = session.metadata["key_exchange"]
 
         # Add CID to key exchange buffer
+        logger.info("Adding key exchange CID for %s (state=%s)", session.peer_address, session.state.value)
         is_complete = key_exchange.add_key_exchange_chunk(
             cid, invert=not self.is_client
         )
+        logger.info("Key exchange CID added for %s: complete=%s", session.peer_address, is_complete)
 
         if session.state == CovertState.IDLE:
             session.state = CovertState.KEY_EXCHANGE_INIT
@@ -338,14 +353,16 @@ class SessionManager:
             return []
 
         # Try to reconstruct peer key
+        logger.info("Attempting to reconstruct peer key for %s", session.peer_address)
         success = key_exchange.reconstruct_peer_key(invert=not self.is_client)
+        logger.info("Key reconstruction for %s: success=%s", session.peer_address, success)
         if success:
             key_manager = session.metadata["key_manager"]
             session.peer_public_key = key_manager.peer_public_key
             session.shared_secret = key_manager.shared_secret
             session.state = CovertState.KEY_EXCHANGE_COMPLETE
 
-            logger.info("Key exchange complete for %s", session.peer_address)
+            logger.info("✅ Key exchange complete for %s", session.peer_address)
 
             # Send keep-alive to confirm
             self.queue_message(
@@ -524,3 +541,17 @@ class SessionManager:
         """
         with self._lock:
             return list(self._sessions.keys())
+
+    def has_pending_messages(self, peer_address: str) -> bool:
+        """Check if peer has pending messages to send
+
+        Args:
+            peer_address: Peer IP address
+
+        Returns:
+            True if messages pending
+        """
+        with self._lock:
+            if peer_address not in self._outgoing_cids:
+                return False
+            return len(self._outgoing_cids[peer_address]) > 0
