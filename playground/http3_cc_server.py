@@ -9,11 +9,13 @@ from email.utils import formatdate
 from typing import Callable, Deque, Dict, List, Optional, Union, cast
 
 import aioquic
+import aioquic.quic.ccrypto_improved
+import aioquic.quic.connection
+import quiccli
+import uvloop
 import wsproto
 import wsproto.events
 from aioquic.asyncio import QuicConnectionProtocol, serve
-from aioquic.quic import ccrypto
-import aioquic.quic.connection
 from aioquic.h0.connection import H0_ALPN, H0Connection
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import (
@@ -28,14 +30,6 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent
 from aioquic.quic.logger import QuicFileLogger
 from aioquic.tls import SessionTicket
-
-import quiccli
-import aioquic.quic.ccrypto
-
-try:
-    import uvloop
-except ImportError:
-    uvloop = None
 
 AsgiApplication = Callable
 HttpConnection = Union[H0Connection, H3Connection]
@@ -393,9 +387,9 @@ class HttpServerProtocol(QuicConnectionProtocol):
                     transmit=self.transmit,
                 )
             elif method == "CONNECT" and protocol == "webtransport":
-                assert isinstance(
-                    self._http, H3Connection
-                ), "WebTransport is only supported over HTTP/3"
+                assert isinstance(self._http, H3Connection), (
+                    "WebTransport is only supported over HTTP/3"
+                )
                 scope = {
                     "client": client,
                     "headers": headers,
@@ -583,8 +577,9 @@ if __name__ == "__main__":
     # import ASGI application
     module_path, attr_str = args.app.split(":", maxsplit=1)
     import os
-    demo_path = os.path.join(os.path.dirname(__file__), '..', 'examples', 'demo.py')
-    spec = importlib.util.spec_from_file_location('demo', demo_path)
+
+    demo_path = os.path.join(os.path.dirname(__file__), "..", "examples", "demo.py")
+    spec = importlib.util.spec_from_file_location("demo", demo_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     application = getattr(module, attr_str)
@@ -614,8 +609,7 @@ if __name__ == "__main__":
     # load SSL certificate and key
     configuration.load_cert_chain(args.certificate, args.private_key)
 
-    if uvloop is not None:
-        uvloop.install()
+    uvloop.install()
 
     def _run_server():
         asyncio.run(
@@ -627,10 +621,8 @@ if __name__ == "__main__":
                 retry=args.retry,
             )
         )
+
     threading.Thread(target=_run_server).start()
-    
-        
-    cli = quiccli.QuiCCli(
-        is_client = False
-    )
+
+    cli = quiccli.QuiCCli(is_client=False)
     cli.run_cli()

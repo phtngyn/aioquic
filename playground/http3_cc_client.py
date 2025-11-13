@@ -10,9 +10,10 @@ from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast
 from urllib.parse import urlparse
 
 import aioquic
+import quiccli
+import uvloop
 import wsproto
 import wsproto.events
-from aioquic.quic import ccrypto
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.h0.connection import H0_ALPN, H0Connection
@@ -28,14 +29,6 @@ from aioquic.quic.events import QuicEvent
 from aioquic.quic.logger import QuicFileLogger
 from aioquic.quic.packet import QuicProtocolVersion
 from aioquic.tls import CipherSuite, SessionTicket
-
-from Crypto.PublicKey import RSA
-import quiccli
-
-try:
-    import uvloop
-except ImportError:
-    uvloop = None
 
 logger = logging.getLogger("client")
 
@@ -439,11 +432,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "url", type=str, nargs="+", help="the URL to query (must be HTTPS)"
     )
+    parser.add_argument("--file", type=str, help="A file to send via a covert channel")
     parser.add_argument(
-        "--file", type=str, help="A file to send via a covert channel"
-    )
-    parser.add_argument(
-        "--cid-size", type=int, help="Number of bytes for the CID paylod. Lower, more requests, higher less but more detectable", default=6
+        "--cid-size",
+        type=int,
+        help="Number of bytes for the CID paylod. Lower, more requests, higher less but more detectable",
+        default=6,
     )
     parser.add_argument(
         "--ca-certs", type=str, help="load CA certificates from the specified file"
@@ -599,10 +593,9 @@ if __name__ == "__main__":
     if args.certificate is not None:
         configuration.load_cert_chain(args.certificate, args.private_key)
 
-    if uvloop is not None:
-        uvloop.install()
+    uvloop.install()
     cli = quiccli.QuiCCli(
-        send_function = main,
+        send_function=main,
         configuration=configuration,
         urls=args.url,
         data=args.data,
