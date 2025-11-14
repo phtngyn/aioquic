@@ -161,7 +161,7 @@ def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
 
 
 def create_peer_meta():
-    from . import ccrypto_improved as ccrypto
+    from . import ccrypto
 
     return {
         "buffer": [],
@@ -421,7 +421,7 @@ class QuicConnection:
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(addr[0])
         if not peer_meta:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
             peer_meta = create_peer_meta()
             # On the first connection, add a random CID to start because after all chunks of the RSA key
@@ -2012,7 +2012,7 @@ class QuicConnection:
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(peer_ip)
         if self._original_destination_connection_id not in peer_meta["cid_history"]:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
             # New peer, queue up the public key bytes
             # if not self._is_client and not peer_meta['cid_history'] and peer_meta['message_history']:
@@ -2854,7 +2854,7 @@ class QuicConnection:
         Generate new connection IDs.
         """
         if not self._is_client and addr[0] in PEER_META:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
             if PEER_META[addr[0]]["cid_queue"].empty():
                 ccrypto.queue_message(

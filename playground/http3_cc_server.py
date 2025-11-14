@@ -9,7 +9,7 @@ from email.utils import formatdate
 from typing import Callable, Deque, Dict, List, Optional, Union, cast
 
 import aioquic
-import aioquic.quic.ccrypto_improved
+import aioquic.quic.ccrypto
 import aioquic.quic.connection
 import quiccli
 import uvloop
