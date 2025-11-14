@@ -574,6 +574,27 @@ if __name__ == "__main__":
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
+    # Filter out verbose QUIC logs, keep only [QuiCC] messages
+    class QuiCCFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            # Block verbose QUIC library logs
+            if any(
+                x in msg
+                for x in [
+                    "Duplicate CRYPTO data",
+                    "HTTP request CONNECT",
+                    "Connection close",
+                    "New session ticket",
+                ]
+            ):
+                return False
+            # Allow [QuiCC] prefixed messages and non-quic/client loggers
+            return "[QuiCC]" in msg or record.name not in ["quic", "client"]
+
+    for logger_name in ["quic", "client"]:
+        logging.getLogger(logger_name).addFilter(QuiCCFilter())
+
     # import ASGI application
     module_path, attr_str = args.app.split(":", maxsplit=1)
     import os
@@ -604,6 +625,7 @@ if __name__ == "__main__":
         max_datagram_size=args.max_datagram_size,
         quic_logger=quic_logger,
         secrets_log_file=secrets_log_file,
+        connection_id_length=20,  # Max CID size for covert channel
     )
 
     # load SSL certificate and key

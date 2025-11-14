@@ -399,11 +399,11 @@ async def main(
             # send some messages and receive reply
             for i in range(2):
                 message = "Hello {}, WebSocket!".format(i)
-                print("> " + message)
+                # print("> " + message)
                 await ws.send(message)
 
                 message = await ws.recv()
-                print("< " + message)
+                # print("< " + message)
 
             await ws.close()
         else:
@@ -550,6 +550,27 @@ if __name__ == "__main__":
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
+    # Filter out verbose QUIC logs, keep only [QuiCC] messages
+    class QuiCCFilter(logging.Filter):
+        def filter(self, record):
+            msg = record.getMessage()
+            # Block verbose QUIC library logs
+            if any(
+                x in msg
+                for x in [
+                    "Duplicate CRYPTO data",
+                    "HTTP request CONNECT",
+                    "Connection close",
+                    "New session ticket",
+                ]
+            ):
+                return False
+            # Allow [QuiCC] prefixed messages and non-quic/client loggers
+            return "[QuiCC]" in msg or record.name not in ["quic", "client"]
+
+    for logger_name in ["quic", "client"]:
+        logging.getLogger(logger_name).addFilter(QuiCCFilter())
+
     if args.output_dir is not None and not os.path.isdir(args.output_dir):
         raise Exception("%s is not a directory" % args.output_dir)
 
@@ -559,6 +580,7 @@ if __name__ == "__main__":
         alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN,
         congestion_control_algorithm=args.congestion_control_algorithm,
         max_datagram_size=args.max_datagram_size,
+        connection_id_length=20,  # Max CID size for covert channel
     )
     if args.ca_certs:
         configuration.load_verify_locations(args.ca_certs)

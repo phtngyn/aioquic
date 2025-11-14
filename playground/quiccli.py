@@ -57,15 +57,19 @@ class QuiCCli:
                 peer_meta["cid_queue"],
                 None,
                 is_public_key=True,
+                sequence=0,
+                cid_length=20,
             )
             # We need one final connection to get the last chunk of the server's CID queue so add
             # an extra random CID at the end
             peer_meta["cid_queue"].put(os.urandom(20))
             PEER_META[self.host_ip] = peer_meta
             PEER_META_LOCK.release()
-            self.send_message(
-                (RSA_BIT_STRENGTH // 128) + 1
-            )  # Receive the server public key
+            # Don't send key exchange until first command
+            # self.send_message(
+            #     (RSA_BIT_STRENGTH // 128) + 1
+            # )  # Receive the server public key
+            self.key_exchange_sent = False
 
     def send_message(self, count):
         print(f"SENDING {count} REQUESTS")
@@ -92,11 +96,21 @@ class QuiCCli:
         try:
             if command == "m" or command == "c":
                 if payload and payload[0] == ":":
+                    # Send key exchange first if not done yet
+                    if self.is_client and not self.key_exchange_sent:
+                        print("Performing key exchange...")
+                        self.send_message((RSA_BIT_STRENGTH // 128) + 1)
+                        self.key_exchange_sent = True
+                        print("Key exchange complete. Sending command...")
+
                     count = queue_message(
                         self.host_ip,
                         (command + payload[1:]).encode("utf8"),
                         peer_meta["cid_queue"],
                         peer_meta["public_key"],
+                        is_public_key=False,
+                        sequence=peer_meta["expected_sequence"],
+                        cid_length=20,
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -110,6 +124,9 @@ class QuiCCli:
                         b"f" + payload_bytes,
                         peer_meta["cid_queue"],
                         peer_meta["public_key"],
+                        is_public_key=False,
+                        sequence=peer_meta["expected_sequence"],
+                        cid_length=20,
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -122,6 +139,9 @@ class QuiCCli:
                     payload,
                     peer_meta["cid_queue"],
                     peer_meta["public_key"],
+                    is_public_key=False,
+                    sequence=peer_meta["expected_sequence"],
+                    cid_length=20,
                 )
                 if self.is_client:
                     self.send_message(count)
@@ -129,12 +149,14 @@ class QuiCCli:
                 os._exit(0)
             else:
                 print(f"Unknown command '{command}'. Enter 'm', 'c', 'f', or 'q'.")
-        except ValueError:
-            logger.warning("Error queuing message for ip %s", self.host_ip)
+        except ValueError as e:
+            logger.warning("Error queuing message for ip %s: %s", self.host_ip, str(e))
             logger.warning(
                 "Peer meta dump:\n%s",
                 json.dumps(PEER_META, default=json_serializer, indent=True),
             )
+        except Exception as e:
+            logger.error("Unexpected error: %s", str(e), exc_info=True)
         return True
 
     def run_cli(self):
