@@ -1,5 +1,5 @@
 - Be extremely consise and sacrifice grammar for the sake of concision.
 - Autosave with trigger linting by ruff.
-- Do not generate summary markdown file
+- Do not generate any markdown file.
 - Always run with the venv python: `.venv/bin/python`
 - use `gtimeout` instead of `timeout`

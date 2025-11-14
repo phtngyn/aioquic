@@ -38,15 +38,17 @@ def obfuscate_modulus(n_bytes: bytes) -> bytes:
 
     Limitation addressed: "Statistical Analysis of Odd Numbered Connection IDs"
 
-    XOR with deterministic but high-entropy mask derived from the modulus itself.
-    This maintains uniqueness while hiding odd/even patterns.
+    XOR with deterministic position-based mask for reversibility.
+    The mask is derived from a fixed seed + position to maintain high entropy.
     """
-    # Use hash of modulus as seed for consistent obfuscation
-    seed = hashlib.sha256(n_bytes).digest()
+    # Use fixed seed for deterministic, reversible obfuscation
+    # This seed should be agreed upon between client/server
+    OBFUSCATION_SEED = b"QuiCC_Obfuscation_v1"
+
     mask = bytearray()
     for i in range(len(n_bytes)):
-        # Generate mask bytes from seed
-        mask_byte = hashlib.sha256(seed + i.to_bytes(4, "big")).digest()[0]
+        # Generate mask bytes from fixed seed + position
+        mask_byte = hashlib.sha256(OBFUSCATION_SEED + i.to_bytes(4, "big")).digest()[0]
         mask.append(mask_byte)
 
     # XOR obfuscation maintains entropy but hides parity
@@ -55,8 +57,11 @@ def obfuscate_modulus(n_bytes: bytes) -> bytes:
 
 
 def deobfuscate_modulus(obfuscated: bytes) -> bytes:
-    """Reverse obfuscation to recover original N modulus."""
-    # Same operation as obfuscation (XOR is reversible)
+    """
+    Reverse obfuscation to recover original N modulus.
+
+    Since XOR with the same mask is self-inverse, we just apply the same operation.
+    """
     return obfuscate_modulus(obfuscated)
 
 
@@ -292,20 +297,22 @@ def queue_message(
     public_key,
     is_public_key=False,
     sequence=0,
-    cid_length=20,  # Fixed at 20 for backward compat (16 byte chunks + 4 byte order)
+    cid_length=20,
 ):
     """
-    Backward compatible queue_message matching old behavior.
+    Queue message with obfuscation for stealth.
 
-    Uses 16-byte chunks without obfuscation or sequence for compatibility.
+    Obfuscates public keys to prevent statistical detection of odd RSA moduli.
     """
     cid_payloads = []
 
     if is_public_key:
-        # No obfuscation for backward compatibility
-        chunk_size = 16  # Fixed 16-byte chunks like old version
+        # Obfuscate modulus to prevent statistical odd-number detection
+        obfuscated_payload = obfuscate_modulus(payload)
+        chunk_size = 16  # Fixed 16-byte chunks
         cid_payloads = [
-            payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)
+            obfuscated_payload[i : i + chunk_size]
+            for i in range(0, len(obfuscated_payload), chunk_size)
         ]
         # Order bytes at end for public keys
         cid_payloads = [
@@ -321,7 +328,7 @@ def queue_message(
         # Use old encrypt() without sequence for backward compatibility
         encrypted_payload = encrypt(public_key, payload)
 
-        chunk_size = 16  # Fixed 16-byte chunks like old version
+        chunk_size = 16  # Fixed 16-byte chunks
         cid_payloads = [
             encrypted_payload[i : i + chunk_size]
             for i in range(0, len(encrypted_payload), chunk_size)
@@ -354,7 +361,3 @@ def generate_sync_recovery_message() -> bytes:
 def is_sync_recovery_message(message: bytes) -> bool:
     """Check if message is a sync recovery beacon."""
     return message.startswith(b"SYNC_RECOVERY_")
-    message = b"QuiCC will be impossible to detect."
-    encrypted_payload = encrypt(public_key, message)
-    decrypted_message = try_decrypt(private_key, encrypted_payload)
-    print(decrypted_message)

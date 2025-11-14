@@ -2035,14 +2035,16 @@ class QuicConnection:
                 if len(peer_meta["buffer"]) == RSA_BIT_STRENGTH // 128 + 1:
                     if self._is_client:
                         # The client will have a dummy cid at the start of the buffer
-                        key_bytes = ccrypto.reconstruct_payload(
+                        obfuscated_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][1:], invert=True
                         )
                     else:
                         # The server will have a dummy cid at the end of the buffer
-                        key_bytes = ccrypto.reconstruct_payload(
+                        obfuscated_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][:-1], invert=True
                         )
+                    # Deobfuscate to get actual modulus
+                    key_bytes = ccrypto.deobfuscate_modulus(obfuscated_bytes)
                     logger.info(
                         "My Modulus: %s",
                         ccrypto.get_compact_key(peer_meta["private_key"]).hex(),
