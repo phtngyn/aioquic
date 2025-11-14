@@ -336,7 +336,6 @@ def save_session_ticket(ticket: SessionTicket) -> None:
     Callback which is invoked by the TLS engine when a new session ticket
     is received.
     """
-    logger.info("New session ticket received")
     if args.session_ticket:
         with open(args.session_ticket, "wb") as fp:
             pickle.dump(ticket, fp)
@@ -399,11 +398,11 @@ async def main(
             # send some messages and receive reply
             for i in range(2):
                 message = "Hello {}, WebSocket!".format(i)
-                print("> " + message)
+                # print("> " + message)
                 await ws.send(message)
 
                 message = await ws.recv()
-                print("< " + message)
+                # print("< " + message)
 
             await ws.close()
         else:

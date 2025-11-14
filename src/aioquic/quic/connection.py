@@ -1317,9 +1317,9 @@ class QuicConnection:
                         ]
                         break
             self._version_negotiated_compatible = True
-            self._logger.info(
-                "Negotiated protocol version %s", pretty_protocol_version(self._version)
-            )
+            # self._logger.info(
+            #     "Negotiated protocol version %s", pretty_protocol_version(self._version)
+            # )
 
         # Notify the application.
         self._events.append(events.ProtocolNegotiated(alpn_protocol=alpn_protocol))
@@ -1792,9 +1792,9 @@ class QuicConnection:
                 )
                 self._unblock_streams(is_unidirectional=False)
                 self._unblock_streams(is_unidirectional=True)
-                self._logger.info(
-                    "ALPN negotiated protocol %s", self.tls.alpn_negotiated
-                )
+                # self._logger.info(
+                #     "ALPN negotiated protocol %s", self.tls.alpn_negotiated
+                # )
         else:
             self._logger.info(
                 "Duplicate CRYPTO data received for epoch %s", context.epoch
@@ -3202,9 +3202,9 @@ class QuicConnection:
         ):
             self._version = self._crypto_packet_version
             self._version_negotiated_compatible = True
-            self._logger.info(
-                "Negotiated protocol version %s", pretty_protocol_version(self._version)
-            )
+            # self._logger.info(
+            #     "Negotiated protocol version %s", pretty_protocol_version(self._version)
+            # )
 
         secrets_log_file = self._configuration.secrets_log_file
         if secrets_log_file is not None:
