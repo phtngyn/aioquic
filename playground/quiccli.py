@@ -3,7 +3,7 @@ import json
 import logging
 import os
 
-from aioquic.quic.ccrypto_improved import get_compact_key, queue_message
+from aioquic.quic.ccrypto import get_compact_key, queue_message
 from aioquic.quic.connection import (
     PEER_META,
     PEER_META_LOCK,

