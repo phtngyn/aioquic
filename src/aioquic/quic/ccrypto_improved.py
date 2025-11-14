@@ -285,35 +285,29 @@ def generate_ordered_bytes(n, size=4):
     return sorted(list(prefixes))
 
 
-def queue_message_improved(
+def queue_message(
     host_ip,
     payload: bytes,
     queue,
     public_key,
     is_public_key=False,
     sequence=0,
-    cid_length=MAX_CID_LENGTH,
+    cid_length=20,  # Fixed at 20 for backward compat (16 byte chunks + 4 byte order)
 ):
     """
-    Improved message queuing with variable CID length and sequence support.
+    Backward compatible queue_message matching old behavior.
 
-    Limitations addressed:
-    - Uses larger CIDs for better bandwidth (up to MAX_CID_LENGTH)
-    - Adds sequence numbers for sync recovery
-    - Obfuscates public keys to prevent statistical detection
+    Uses 16-byte chunks without obfuscation or sequence for compatibility.
     """
     cid_payloads = []
 
     if is_public_key:
-        # Obfuscate modulus to hide odd number pattern
-        obfuscated_payload = obfuscate_modulus(payload)
-
-        # Variable chunk size based on CID length
-        chunk_size = cid_length - 4  # Reserve 4 bytes for ordering
+        # No obfuscation for backward compatibility
+        chunk_size = 16  # Fixed 16-byte chunks like old version
         cid_payloads = [
-            obfuscated_payload[i : i + chunk_size]
-            for i in range(0, len(obfuscated_payload), chunk_size)
+            payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)
         ]
+        # Order bytes at end for public keys
         cid_payloads = [
             v[0] + v[1]
             for v in zip(cid_payloads, generate_ordered_bytes(len(cid_payloads)))
@@ -324,16 +318,15 @@ def queue_message_improved(
         )
         raise ValueError(f"RSA key required by {public_key} was provided.")
     else:
-        # Encrypt with sequence number for sync recovery
-        encrypted_payload = encrypt_with_sequence(public_key, payload, sequence)
+        # Use old encrypt() without sequence for backward compatibility
+        encrypted_payload = encrypt(public_key, payload)
 
-        # Variable chunk size
-        chunk_size = cid_length - 4
+        chunk_size = 16  # Fixed 16-byte chunks like old version
         cid_payloads = [
             encrypted_payload[i : i + chunk_size]
             for i in range(0, len(encrypted_payload), chunk_size)
         ]
-        # Prepend ordered prefixes
+        # Order bytes at start for encrypted messages
         cid_payloads = [
             v[0] + v[1]
             for v in zip(generate_ordered_bytes(len(cid_payloads)), cid_payloads)
@@ -345,11 +338,11 @@ def queue_message_improved(
     for cid in cid_payloads:
         queue.put(cid)
 
-    logger.debug(f"Queued {len(cid_payloads)} CID chunks for {host_ip}, seq={sequence}")
+    logger.debug(f"Queued {len(cid_payloads)} CID chunks for {host_ip}")
     return len(cid_payloads)
 
 
-def queue_message(host_ip, payload, queue, public_key, is_public_key=False):
+def queue_message_old(host_ip, payload, queue, public_key, is_public_key=False):
     """Backward compatible queue_message (no sequence support)."""
     cid_payloads = []
     if is_public_key:

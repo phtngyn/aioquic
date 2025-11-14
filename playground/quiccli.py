@@ -52,10 +52,10 @@ class QuiCCli:
             key_bytes = get_compact_key(peer_meta["private_key"])
             open("client-public-key-client.bin", "wb").write(key_bytes)
             queue_message(
-                self.host_ip,
-                key_bytes,
-                peer_meta["cid_queue"],
-                None,
+                host_ip=self.host_ip,
+                payload=key_bytes,
+                queue=peer_meta["cid_queue"],
+                public_key=None,
                 is_public_key=True,
             )
             # We need one final connection to get the last chunk of the server's CID queue so add
@@ -93,10 +93,10 @@ class QuiCCli:
             if command == "m" or command == "c":
                 if payload and payload[0] == ":":
                     count = queue_message(
-                        self.host_ip,
-                        (command + payload[1:]).encode("utf8"),
-                        peer_meta["cid_queue"],
-                        peer_meta["public_key"],
+                        host_ip=self.host_ip,
+                        payload=(command + payload[1:]).encode("utf8"),
+                        queue=peer_meta["cid_queue"],
+                        public_key=peer_meta["public_key"],
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -106,10 +106,10 @@ class QuiCCli:
                 if payload and payload[0] == ":":
                     payload_bytes = open(payload[1:], "rb").read()
                     count = queue_message(
-                        self.host_ip,
-                        b"f" + payload_bytes,
-                        peer_meta["cid_queue"],
-                        peer_meta["public_key"],
+                        host_ip=self.host_ip,
+                        payload=b"f" + payload_bytes,
+                        queue=peer_meta["cid_queue"],
+                        public_key=peer_meta["public_key"],
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -118,10 +118,10 @@ class QuiCCli:
             elif command == "k":
                 payload = b"k"
                 count = queue_message(
-                    self.host_ip,
-                    payload,
-                    peer_meta["cid_queue"],
-                    peer_meta["public_key"],
+                    host_ip=self.host_ip,
+                    payload=payload,
+                    queue=peer_meta["cid_queue"],
+                    public_key=peer_meta["public_key"],
                 )
                 if self.is_client:
                     self.send_message(count)
