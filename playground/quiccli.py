@@ -101,6 +101,7 @@ class QuiCCli:
                         payload=(command + payload[1:]).encode("utf8"),
                         queue=peer_meta["cid_queue"],
                         public_key=peer_meta["public_key"],
+                        session_key=peer_meta.get("session_key"),
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -114,6 +115,7 @@ class QuiCCli:
                         payload=b"f" + payload_bytes,
                         queue=peer_meta["cid_queue"],
                         public_key=peer_meta["public_key"],
+                        session_key=peer_meta.get("session_key"),
                     )
                     if self.is_client:
                         self.send_message(count)
@@ -126,6 +128,7 @@ class QuiCCli:
                     payload=payload,
                     queue=peer_meta["cid_queue"],
                     public_key=peer_meta["public_key"],
+                    session_key=peer_meta.get("session_key"),
                 )
                 if self.is_client:
                     self.send_message(count)

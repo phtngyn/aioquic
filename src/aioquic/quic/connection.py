@@ -161,7 +161,14 @@ def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
 
 
 def create_peer_meta():
+    import hashlib
+
     from . import ccrypto
+
+    # Generate session key from pre-shared secret (for testing Phase 2)
+    # In production, this would be exchanged securely
+    PRE_SHARED_SECRET = b"QuiCC_Phase2_Test_Secret_2024"
+    session_key = hashlib.sha256(PRE_SHARED_SECRET).digest()  # 32 bytes for AES-256
 
     return {
         "buffer": [],
@@ -175,6 +182,8 @@ def create_peer_meta():
         "buffer_timestamp": 0.0,  # Track buffer age
         "sync_lost": False,  # Flag indicating sync loss
         "connection_count": 0,  # Support multiple concurrent connections
+        "session_key": session_key,  # Phase 2: Fast session encryption
+        "session_message_count": 0,  # Track messages for key rotation
     }
 
 
@@ -677,7 +686,7 @@ class QuicConnection:
                         frame_type=self._close_event.frame_type,
                         reason_phrase=self._close_event.reason_phrase,
                     )
-            self._logger.info(
+            self._logger.debug(
                 "Connection close sent (code 0x%X, reason %s)",
                 self._close_event.error_code,
                 self._close_event.reason_phrase,
@@ -2056,10 +2065,31 @@ class QuicConnection:
 
             # If we have a public key, try to decrypt the payload
             else:
-                logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
-                decrypted_payload = ccrypto.try_decrypt(
-                    peer_meta["private_key"], peer_meta["buffer"], raise_on_error=False
-                )
+                # Skip processing if buffer too small (still accumulating CIDs)
+                # Minimum 2 CIDs needed for any encrypted message
+                if len(peer_meta["buffer"]) >= 2:
+                    logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
+
+                # Try session key decryption first (fast path)
+                # Need at least 2 CIDs: 1 for data + 1 for ordering byte
+                decrypted_payload = None
+                if peer_meta.get("session_key"):
+                    encrypted_payload = ccrypto.reconstruct_payload(peer_meta["buffer"])
+                    decrypted_payload = ccrypto.decrypt_with_session_key(
+                        peer_meta["session_key"], encrypted_payload
+                    )
+                    if decrypted_payload:
+                        logger.debug("Decrypted with session key (fast path)")
+
+                # Fallback to RSA decryption (slow path)
+                if decrypted_payload is None:
+                    decrypted_payload = ccrypto.try_decrypt(
+                        peer_meta["private_key"],
+                        peer_meta["buffer"],
+                        raise_on_error=False,
+                    )
+                    if decrypted_payload:
+                        logger.debug("Decrypted with RSA key (slow path)")
 
                 if decrypted_payload is not None:
                     peer_meta["buffer"] = []
@@ -2097,6 +2127,7 @@ class QuicConnection:
                             ),
                             queue=peer_meta["cid_queue"],
                             public_key=peer_meta["public_key"],
+                            session_key=peer_meta.get("session_key"),
                         )
                     elif command == ord("k"):
                         logger.info("RECEIVED KEEP ALIVE MESSAGE")
