@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import os
+import random
 import struct
 import time
 import zlib
@@ -342,8 +343,13 @@ def queue_message(
     # Shuffle to prevent ordering correlation
     shuffle(cid_payloads)
 
-    for cid in cid_payloads:
+    for i, cid in enumerate(cid_payloads):
         queue.put(cid)
+        # Add timing jitter (50-200ms) to prevent traffic analysis
+        # Skip delay on last chunk to avoid unnecessary wait
+        if i < len(cid_payloads) - 1:
+            jitter = random.uniform(0.05, 0.2)
+            time.sleep(jitter)
 
     logger.debug(f"Queued {len(cid_payloads)} CID chunks for {host_ip}")
     return len(cid_payloads)
