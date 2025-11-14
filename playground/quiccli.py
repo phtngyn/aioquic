@@ -41,12 +41,14 @@ class QuiCCli:
         self.output_dir = output_dir
         self.local_port = local_port
         self.zero_rtt = (zero_rtt,)
+        self.key_exchange_done = False
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
             if self.host == "localhost" or self.host_ip == "127.0.0.1":
                 self.host_ip = "::1"
             else:
                 self.host_ip = "::ffff:" + self.host_ip
+            # Prepare peer meta but don't connect yet
             PEER_META_LOCK.acquire(timeout=5)
             peer_meta = create_peer_meta()
             key_bytes = get_compact_key(peer_meta["private_key"])
@@ -58,14 +60,11 @@ class QuiCCli:
                 public_key=None,
                 is_public_key=True,
             )
-            # We need one final connection to get the last chunk of the server's CID queue so add
-            # an extra random CID at the end
+            # We need one final connection to get the last chunk of the
+            # server's CID queue so add an extra random CID at the end
             peer_meta["cid_queue"].put(os.urandom(20))
             PEER_META[self.host_ip] = peer_meta
             PEER_META_LOCK.release()
-            self.send_message(
-                (RSA_BIT_STRENGTH // 128) + 1
-            )  # Receive the server public key
 
     def send_message(self, count):
         print(f"SENDING {count} REQUESTS")
@@ -89,6 +88,11 @@ class QuiCCli:
         payload = command_input[1:]
         if self.is_client:
             peer_meta = PEER_META.get(self.host_ip)
+            # Do key exchange on first command
+            if not self.key_exchange_done:
+                print("Connecting to server and exchanging keys...")
+                self.send_message((RSA_BIT_STRENGTH // 128) + 1)
+                self.key_exchange_done = True
         try:
             if command == "m" or command == "c":
                 if payload and payload[0] == ":":
