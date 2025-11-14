@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from aioquic.quic.ccrypto import get_compact_key, queue_message
 from aioquic.quic.connection import (
@@ -42,6 +43,12 @@ class QuiCCli:
         self.local_port = local_port
         self.zero_rtt = (zero_rtt,)
         self.key_exchange_done = False
+        # Connection pooling: reuse connections
+        self.active_connection = None
+        self.connection_cid_count = 0
+        self.max_cids_per_connection = 50  # Reuse connection for up to 50 CIDs
+        self.connection_created_at = None  # Track connection age
+        self.connection_timeout = 30.0  # Seconds before connection considered stale
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
             if self.host == "localhost" or self.host_ip == "127.0.0.1":
@@ -70,7 +77,40 @@ class QuiCCli:
         print(f"SENDING {count} REQUESTS")
         send_urls = [self.urls[i % len(self.urls)] for i in range(count)]
         for i, url in enumerate(send_urls):
-            print(f"SENDING REQUEST {i + 1}/{count}")
+            # Connection pooling: health check
+            now = time.time()
+            connection_age = (
+                now - self.connection_created_at
+                if self.connection_created_at
+                else float("inf")
+            )
+            is_connection_stale = connection_age > self.connection_timeout
+
+            should_create_new = (
+                self.active_connection is None
+                or self.connection_cid_count >= self.max_cids_per_connection
+                or is_connection_stale
+            )
+
+            if should_create_new:
+                reason = (
+                    "no connection"
+                    if self.active_connection is None
+                    else "stale"
+                    if is_connection_stale
+                    else "count limit"
+                )
+                print(f"SENDING REQUEST {i + 1}/{count} (new connection: {reason})")
+                self.connection_cid_count = 0
+                self.connection_created_at = now
+                self.active_connection = url
+            else:
+                print(
+                    f"SENDING REQUEST {i + 1}/{count} (reusing connection, age={connection_age:.1f}s)"
+                )
+
+            self.connection_cid_count += 1
+
             asyncio.run(
                 self.send_function(
                     configuration=self.configuration,
