@@ -526,8 +526,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--host",
         type=str,
-        default="::",
-        help="listen on the specified address (defaults to ::)",
+        default="0.0.0.0",
+        help="listen on the specified address (defaults to 0.0.0.0)",
     )
     parser.add_argument(
         "--port",

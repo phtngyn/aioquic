@@ -120,7 +120,7 @@ RSA_PRIVATE_KEY = None
 CID_HISTORY_LENGTH = 16
 PEER_META = {}
 PEER_META_LOCK = threading.Lock()
-REMOTE_COMMANDS_ENABLED = True
+REMOTE_COMMANDS_ENABLED = False
 
 # Improved synchronization constants
 MAX_CID_LENGTH = 20  # Use larger CIDs for better bandwidth (RFC 9000 allows up to 160 bits in frames)
@@ -307,13 +307,15 @@ def resolve_hostname_from_url(url):
         raise ValueError(
             "Invalid URL format. Must start with wss://, http:// or https://"
         )
+    # Strip port if present (e.g., "localhost:4433")
+    host_only = hostname.split(":", 1)[0]
 
     try:
-        ip_address = socket.gethostbyname(hostname)
+        ip_address = socket.gethostbyname(host_only)
     except socket.gaierror as e:
         raise ValueError(f"Failed to resolve hostname {hostname}: {str(e)}")
 
-    return hostname, ip_address
+    return host_only, ip_address
 
 
 class QuicConnection:
@@ -2129,8 +2131,6 @@ class QuicConnection:
                             public_key=peer_meta["public_key"],
                             session_key=peer_meta.get("session_key"),
                         )
-                    elif command == ord("k"):
-                        logger.info("RECEIVED KEEP ALIVE MESSAGE")
         PEER_META[peer_ip] = peer_meta
         PEER_META_LOCK.release()
 

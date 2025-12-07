@@ -51,10 +51,9 @@ class QuiCCli:
         self.connection_timeout = 30.0  # Seconds before connection considered stale
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
-            if self.host == "localhost" or self.host_ip == "127.0.0.1":
+            # For localhost, prefer IPv6 loopback to match server running on ::
+            if self.host == "localhost" and self.host_ip == "127.0.0.1":
                 self.host_ip = "::1"
-            else:
-                self.host_ip = "::ffff:" + self.host_ip
             # Prepare peer meta but don't connect yet
             PEER_META_LOCK.acquire(timeout=5)
             peer_meta = create_peer_meta()
@@ -134,7 +133,7 @@ class QuiCCli:
                 self.send_message((RSA_BIT_STRENGTH // 128) + 1)
                 self.key_exchange_done = True
         try:
-            if command == "m" or command == "c":
+            if command == "m":
                 if payload and payload[0] == ":":
                     count = queue_message(
                         host_ip=self.host_ip,
@@ -161,21 +160,10 @@ class QuiCCli:
                         self.send_message(count)
                 else:
                     return False
-            elif command == "k":
-                payload = b"k"
-                count = queue_message(
-                    host_ip=self.host_ip,
-                    payload=payload,
-                    queue=peer_meta["cid_queue"],
-                    public_key=peer_meta["public_key"],
-                    session_key=peer_meta.get("session_key"),
-                )
-                if self.is_client:
-                    self.send_message(count)
             elif command == "q":
                 os._exit(0)
             else:
-                print(f"Unknown command '{command}'. Enter 'm', 'c', 'f', or 'q'.")
+                print(f"Unknown command '{command}'. Enter 'm', 'f', or 'q'.")
         except ValueError:
             logger.warning("Error queuing message for ip %s", self.host_ip)
             logger.warning(
@@ -187,9 +175,7 @@ class QuiCCli:
     def run_cli(self):
         print("Welcome to the QuiCC console.")
         print("Enter 'm:[MESSAGE]' to send a message.")
-        print("Enter 'c:[COMMAND]' to send a remote command.")
         print("Enter 'f:[FILE]' to send a file.")
-        print("Enter 'k' to send a keepalive message to recieve responses.")
         print("Enter 'q' to quit.")
 
         while True:
