@@ -1,7 +1,10 @@
 import argparse
 import asyncio
+import datetime
 import importlib.util
+import ipaddress
 import logging
+import pathlib
 import threading
 import time
 from collections import deque
@@ -9,8 +12,6 @@ from email.utils import formatdate
 from typing import Callable, Deque, Dict, List, Optional, Union, cast
 
 import aioquic
-import aioquic.quic.ccrypto
-import aioquic.quic.connection
 import quiccli
 import uvloop
 import wsproto
@@ -28,13 +29,56 @@ from aioquic.h3.events import (
 from aioquic.h3.exceptions import NoAvailablePushIDError
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import DatagramFrameReceived, ProtocolNegotiated, QuicEvent
-from aioquic.quic.logger import QuicFileLogger
-from aioquic.tls import SessionTicket
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 AsgiApplication = Callable
 HttpConnection = Union[H0Connection, H3Connection]
 
 SERVER_NAME = "aioquic/" + aioquic.__version__
+
+
+def ensure_self_signed(
+    cert_path: pathlib.Path, key_path: pathlib.Path, host: str
+) -> None:
+    """Create a self-signed cert/key pair if missing for local use."""
+    if cert_path.exists() and key_path.exists():
+        return
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    alt_names = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        x509.IPAddress(ipaddress.IPv6Address("::1")),
+    ]
+    try:
+        alt_names.append(x509.IPAddress(ipaddress.ip_address(host)))
+    except ValueError:
+        alt_names.append(x509.DNSName(host))
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(minutes=1))
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
 class HttpRequestHandler:
@@ -465,108 +509,40 @@ class HttpServerProtocol(QuicConnectionProtocol):
                 self.http_event_received(http_event)
 
 
-class SessionTicketStore:
-    """
-    Simple in-memory store for session tickets.
-    """
-
-    def __init__(self) -> None:
-        self.tickets: Dict[bytes, SessionTicket] = {}
-
-    def add(self, ticket: SessionTicket) -> None:
-        self.tickets[ticket.ticket] = ticket
-
-    def pop(self, label: bytes) -> Optional[SessionTicket]:
-        return self.tickets.pop(label, None)
-
-
-async def main(
-    host: str,
-    port: int,
-    configuration: QuicConfiguration,
-    session_ticket_store: SessionTicketStore,
-    retry: bool,
-) -> None:
+async def main(host: str, port: int, configuration: QuicConfiguration) -> None:
     await serve(
         host,
         port,
         configuration=configuration,
         create_protocol=HttpServerProtocol,
-        session_ticket_fetcher=session_ticket_store.pop,
-        session_ticket_handler=session_ticket_store.add,
-        retry=retry,
     )
     await asyncio.Future()
 
 
 if __name__ == "__main__":
-    defaults = QuicConfiguration(is_client=False)
-
-    parser = argparse.ArgumentParser(description="QUIC server")
+    parser = argparse.ArgumentParser(description="HTTP/3 covert server")
     parser.add_argument(
         "app",
         type=str,
         nargs="?",
-        default="aioquic/examples/demo.py:app",
-        help="Relative path to python file with the ASGI application as <module_path>:<attribute>",
+        default="demo:app",
+        help="ASGI app as <module>:<attr>",
     )
+    parser.add_argument("--host", type=str, default="::1", help="listen address")
+    parser.add_argument("--port", type=int, default=4433, help="listen port")
     parser.add_argument(
-        "-c",
         "--certificate",
         type=str,
-        required=True,
-        help="load the TLS certificate from the specified file",
+        default="playground/ssl_cert.pem",
+        help="TLS cert (auto-generated if missing)",
     )
     parser.add_argument(
-        "--congestion-control-algorithm",
-        type=str,
-        default="reno",
-        help="use the specified congestion control algorithm",
-    )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="0.0.0.0",
-        help="listen on the specified address (defaults to 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=4433,
-        help="listen on the specified port (defaults to 4433)",
-    )
-    parser.add_argument(
-        "-k",
         "--private-key",
         type=str,
-        help="load the TLS private key from the specified file",
+        default="playground/ssl_key.pem",
+        help="TLS key (auto-generated if missing)",
     )
-    parser.add_argument(
-        "-l",
-        "--secrets-log",
-        type=str,
-        help="log secrets to a file, for use with Wireshark",
-    )
-    parser.add_argument(
-        "--max-datagram-size",
-        type=int,
-        default=defaults.max_datagram_size,
-        help="maximum datagram size to send, excluding UDP or IP overhead",
-    )
-    parser.add_argument(
-        "-q",
-        "--quic-log",
-        type=str,
-        help="log QUIC events to QLOG files in the specified directory",
-    )
-    parser.add_argument(
-        "--retry",
-        action="store_true",
-        help="send a retry for new connections",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="increase logging verbosity"
-    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -574,55 +550,34 @@ if __name__ == "__main__":
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
-    # import ASGI application
     module_path, attr_str = args.app.split(":", maxsplit=1)
-    import os
-
-    demo_path = os.path.join(os.path.dirname(__file__), "..", "examples", "demo.py")
-    spec = importlib.util.spec_from_file_location("demo", demo_path)
+    target_path = pathlib.Path(module_path)
+    if not target_path.exists():
+        target_path = pathlib.Path(__file__).parent.parent / "examples" / "demo.py"
+    spec = importlib.util.spec_from_file_location(target_path.stem, target_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     application = getattr(module, attr_str)
 
-    # create QUIC logger
-    if args.quic_log:
-        quic_logger = QuicFileLogger(args.quic_log)
-    else:
-        quic_logger = None
-
-    # open SSL log file
-    if args.secrets_log:
-        secrets_log_file = open(args.secrets_log, "a")
-    else:
-        secrets_log_file = None
+    certificate = pathlib.Path(args.certificate)
+    private_key = pathlib.Path(args.private_key)
+    ensure_self_signed(cert_path=certificate, key_path=private_key, host=args.host)
 
     configuration = QuicConfiguration(
-        alpn_protocols=H3_ALPN + H0_ALPN + ["siduck"],
-        congestion_control_algorithm=args.congestion_control_algorithm,
+        alpn_protocols=H3_ALPN + H0_ALPN,
         is_client=False,
         max_datagram_frame_size=65536,
-        max_datagram_size=args.max_datagram_size,
-        quic_logger=quic_logger,
-        secrets_log_file=secrets_log_file,
     )
-
-    # load SSL certificate and key
-    configuration.load_cert_chain(args.certificate, args.private_key)
+    configuration.load_cert_chain(str(certificate), str(private_key))
 
     uvloop.install()
-
-    def _run_server():
-        asyncio.run(
-            main(
-                host=args.host,
-                port=args.port,
-                configuration=configuration,
-                session_ticket_store=SessionTicketStore(),
-                retry=args.retry,
-            )
+    threading.Thread(
+        target=lambda: asyncio.run(
+            main(host=args.host, port=args.port, configuration=configuration)
         )
+    ).start()
 
-    threading.Thread(target=_run_server).start()
-
-    cli = quiccli.QuiCCli(is_client=False)
+    cli = quiccli.QuiCCli(
+        is_client=False, send_function=None, configuration=None, urls=None
+    )
     cli.run_cli()

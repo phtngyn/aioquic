@@ -310,6 +310,10 @@ def resolve_hostname_from_url(url):
     # Strip port if present (e.g., "localhost:4433")
     host_only = hostname.split(":", 1)[0]
 
+    # Prefer IPv6 for localhost to match asyncio behavior
+    if host_only == "localhost":
+        return host_only, "::1"
+
     try:
         ip_address = socket.gethostbyname(host_only)
     except socket.gaierror as e:
@@ -430,7 +434,8 @@ class QuicConnection:
 
         # Covert channel section for client
         PEER_META_LOCK.acquire(timeout=5)
-        peer_meta = PEER_META.get(addr[0])
+        peer_ip = addr[0]
+        peer_meta = PEER_META.get(peer_ip)
         if not peer_meta:
             from . import ccrypto
 
@@ -458,7 +463,7 @@ class QuicConnection:
         else:
             cid = os.urandom(8)
             self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
-        PEER_META[addr[0]] = peer_meta
+        PEER_META[peer_ip] = peer_meta
         PEER_META_LOCK.release()
 
         self._peer_cid_available: list[QuicConnectionId] = []
@@ -2886,17 +2891,18 @@ class QuicConnection:
         """
         Generate new connection IDs.
         """
-        if not self._is_client and addr[0] in PEER_META:
+        peer_ip = addr[0]
+        if not self._is_client and peer_ip in PEER_META:
             from . import ccrypto
 
-            if PEER_META[addr[0]]["cid_queue"].empty():
+            if PEER_META[peer_ip]["cid_queue"].empty():
                 ccrypto.queue_message(
-                    host_ip=addr[0],
+                    host_ip=peer_ip,
                     payload=b"k",
-                    queue=PEER_META[addr[0]]["cid_queue"],
-                    public_key=PEER_META[addr[0]]["public_key"],
+                    queue=PEER_META[peer_ip]["cid_queue"],
+                    public_key=PEER_META[peer_ip]["public_key"],
                 )
-            hid = PEER_META[addr[0]]["cid_queue"].get()
+            hid = PEER_META[peer_ip]["cid_queue"].get()
             # hid = b'AAAAAAAA'
             self._host_cids.append(
                 QuicConnectionId(

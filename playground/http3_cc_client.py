@@ -1,12 +1,11 @@
 import argparse
 import asyncio
+import datetime
+import ipaddress
 import logging
-import os
-import pickle
-import ssl
-import time
+import pathlib
 from collections import deque
-from typing import BinaryIO, Callable, Deque, Dict, List, Optional, Union, cast
+from typing import Callable, Deque, Dict, List, Optional, Union, cast
 from urllib.parse import urlparse
 
 import aioquic
@@ -16,7 +15,7 @@ import wsproto
 import wsproto.events
 from aioquic.asyncio.client import connect
 from aioquic.asyncio.protocol import QuicConnectionProtocol
-from aioquic.h0.connection import H0_ALPN, H0Connection
+from aioquic.h0.connection import H0Connection
 from aioquic.h3.connection import H3_ALPN, ErrorCode, H3Connection
 from aioquic.h3.events import (
     DataReceived,
@@ -26,15 +25,57 @@ from aioquic.h3.events import (
 )
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent
-from aioquic.quic.logger import QuicFileLogger
-from aioquic.quic.packet import QuicProtocolVersion
-from aioquic.tls import CipherSuite, SessionTicket
-
-logger = logging.getLogger("client")
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 HttpConnection = Union[H0Connection, H3Connection]
 
+DEFAULT_CERT_PATH = pathlib.Path("playground/ssl_cert.pem")
+DEFAULT_KEY_PATH = pathlib.Path("playground/ssl_key.pem")
 USER_AGENT = "aioquic/" + aioquic.__version__
+
+
+def ensure_self_signed(
+    cert_path: pathlib.Path, key_path: pathlib.Path, host: str
+) -> None:
+    """Create a self-signed cert/key pair if missing for local use."""
+    if cert_path.exists() and key_path.exists():
+        return
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    alt_names = [
+        x509.DNSName("localhost"),
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        x509.IPAddress(ipaddress.IPv6Address("::1")),
+    ]
+    try:
+        alt_names.append(x509.IPAddress(ipaddress.ip_address(host)))
+    except ValueError:
+        alt_names.append(x509.DNSName(host))
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(minutes=1))
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
 
 class URL:
@@ -240,115 +281,13 @@ class HttpClient(QuicConnectionProtocol):
         return await asyncio.shield(waiter)
 
 
-async def perform_http_request(
-    client: HttpClient,
-    url: str,
-    data: Optional[str],
-    include: bool,
-    output_dir: Optional[str],
-) -> None:
-    # perform request
-    start = time.time()
-    if data is not None:
-        data_bytes = data.encode()
-        http_events = await client.post(
-            url,
-            data=data_bytes,
-            headers={
-                "content-length": str(len(data_bytes)),
-                "content-type": "application/x-www-form-urlencoded",
-            },
-        )
-        method = "POST"
-    else:
-        http_events = await client.get(url)
-        method = "GET"
-    elapsed = time.time() - start
-
-    # print speed
-    octets = 0
-    for http_event in http_events:
-        if isinstance(http_event, DataReceived):
-            octets += len(http_event.data)
-    logger.info(
-        "Response received for %s %s : %d bytes in %.1f s (%.3f Mbps)"
-        % (method, urlparse(url).path, octets, elapsed, octets * 8 / elapsed / 1000000)
-    )
-
-    # output response
-    if output_dir is not None:
-        output_path = os.path.join(
-            output_dir, os.path.basename(urlparse(url).path) or "index.html"
-        )
-        with open(output_path, "wb") as output_file:
-            write_response(
-                http_events=http_events, include=include, output_file=output_file
-            )
-
-
-def process_http_pushes(
-    client: HttpClient,
-    include: bool,
-    output_dir: Optional[str],
-) -> None:
-    for _, http_events in client.pushes.items():
-        method = ""
-        octets = 0
-        path = ""
-        for http_event in http_events:
-            if isinstance(http_event, DataReceived):
-                octets += len(http_event.data)
-            elif isinstance(http_event, PushPromiseReceived):
-                for header, value in http_event.headers:
-                    if header == b":method":
-                        method = value.decode()
-                    elif header == b":path":
-                        path = value.decode()
-        logger.info("Push received for %s %s : %s bytes", method, path, octets)
-
-        # output response
-        if output_dir is not None:
-            output_path = os.path.join(
-                output_dir, os.path.basename(path) or "index.html"
-            )
-            with open(output_path, "wb") as output_file:
-                write_response(
-                    http_events=http_events, include=include, output_file=output_file
-                )
-
-
-def write_response(
-    http_events: Deque[H3Event], output_file: BinaryIO, include: bool
-) -> None:
-    for http_event in http_events:
-        if isinstance(http_event, HeadersReceived) and include:
-            headers = b""
-            for k, v in http_event.headers:
-                headers += k + b": " + v + b"\r\n"
-            if headers:
-                output_file.write(headers + b"\r\n")
-        elif isinstance(http_event, DataReceived):
-            output_file.write(http_event.data)
-
-
-def save_session_ticket(ticket: SessionTicket) -> None:
-    """
-    Callback which is invoked by the TLS engine when a new session ticket
-    is received.
-    """
-    if args.session_ticket:
-        with open(args.session_ticket, "wb") as fp:
-            pickle.dump(ticket, fp)
+async def perform_http_request(client: HttpClient, url: str) -> None:
+    await client.get(url)
 
 
 async def main(
     configuration: QuicConfiguration,
     urls: List[str],
-    data: Optional[str],
-    include: bool,
-    output_dir: Optional[str],
-    local_port: int,
-    zero_rtt: bool,
 ) -> None:
     # parse URL
     parsed = urlparse(urls[0])
@@ -386,9 +325,6 @@ async def main(
         port,
         configuration=configuration,
         create_protocol=HttpClient,
-        session_ticket_handler=save_session_ticket,
-        local_port=local_port,
-        wait_connected=not zero_rtt,
     ) as client:
         client = cast(HttpClient, client)
 
@@ -407,140 +343,27 @@ async def main(
             await ws.close()
         else:
             # perform request
-            coros = [
-                perform_http_request(
-                    client=client,
-                    url=url,
-                    data=data,
-                    include=include,
-                    output_dir=output_dir,
-                )
-                for url in urls
-            ]
+            coros = [perform_http_request(client=client, url=url) for url in urls]
             await asyncio.gather(*coros)
-
-            # process http pushes
-            process_http_pushes(client=client, include=include, output_dir=output_dir)
         client.close(error_code=ErrorCode.H3_NO_ERROR)
 
 
 if __name__ == "__main__":
-    defaults = QuicConfiguration(is_client=True)
-
-    parser = argparse.ArgumentParser(description="HTTP/3 client")
+    parser = argparse.ArgumentParser(description="HTTP/3 covert client")
     parser.add_argument(
-        "url", type=str, nargs="+", help="the URL to query (must be HTTPS)"
-    )
-    parser.add_argument("--file", type=str, help="A file to send via a covert channel")
-    parser.add_argument(
-        "--cid-size",
-        type=int,
-        help="Number of bytes for the CID paylod. Lower, more requests, higher less but more detectable",
-        default=6,
-    )
-    parser.add_argument(
-        "--ca-certs", type=str, help="load CA certificates from the specified file"
+        "url",
+        type=str,
+        nargs="?",
+        default="https://localhost:4433/",
+        help="HTTPS URL (default: localhost:4433)",
     )
     parser.add_argument(
         "--certificate",
         type=str,
-        help="load the TLS certificate from the specified file",
+        default=str(DEFAULT_CERT_PATH),
+        help="server cert to trust (auto-generated if missing)",
     )
-    parser.add_argument(
-        "--cipher-suites",
-        type=str,
-        help=(
-            "only advertise the given cipher suites, e.g. `AES_256_GCM_SHA384,"
-            "CHACHA20_POLY1305_SHA256`"
-        ),
-    )
-    parser.add_argument(
-        "--congestion-control-algorithm",
-        type=str,
-        default="reno",
-        help="use the specified congestion control algorithm",
-    )
-    parser.add_argument(
-        "-d", "--data", type=str, help="send the specified data in a POST request"
-    )
-    parser.add_argument(
-        "-i",
-        "--include",
-        action="store_true",
-        help="include the HTTP response headers in the output",
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="do not validate server certificate",
-    )
-    parser.add_argument(
-        "--legacy-http",
-        action="store_true",
-        help="use HTTP/0.9",
-    )
-    parser.add_argument(
-        "--max-data",
-        type=int,
-        help="connection-wide flow control limit (default: %d)" % defaults.max_data,
-    )
-    parser.add_argument(
-        "--max-stream-data",
-        type=int,
-        help="per-stream flow control limit (default: %d)" % defaults.max_stream_data,
-    )
-    parser.add_argument(
-        "--negotiate-v2",
-        action="store_true",
-        help="start with QUIC v1 and try to negotiate QUIC v2",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        help="write downloaded files to this directory",
-    )
-    parser.add_argument(
-        "--private-key",
-        type=str,
-        help="load the TLS private key from the specified file",
-    )
-    parser.add_argument(
-        "-q",
-        "--quic-log",
-        type=str,
-        help="log QUIC events to QLOG files in the specified directory",
-    )
-    parser.add_argument(
-        "-l",
-        "--secrets-log",
-        type=str,
-        help="log secrets to a file, for use with Wireshark",
-    )
-    parser.add_argument(
-        "-s",
-        "--session-ticket",
-        type=str,
-        help="read and write session ticket from the specified file",
-    )
-    parser.add_argument(
-        "-v", "--verbose", action="store_true", help="increase logging verbosity"
-    )
-    parser.add_argument(
-        "--local-port",
-        type=int,
-        default=0,
-        help="local port to bind for connections",
-    )
-    parser.add_argument(
-        "--max-datagram-size",
-        type=int,
-        default=defaults.max_datagram_size,
-        help="maximum datagram size to send, excluding UDP or IP overhead",
-    )
-    parser.add_argument(
-        "--zero-rtt", action="store_true", help="try to send requests using 0-RTT"
-    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
 
     args = parser.parse_args()
 
@@ -549,58 +372,25 @@ if __name__ == "__main__":
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
 
-    if args.output_dir is not None and not os.path.isdir(args.output_dir):
-        raise Exception("%s is not a directory" % args.output_dir)
+    parsed = urlparse(args.url)
+    if parsed.scheme not in ("https", "wss"):
+        raise ValueError("Only https:// or wss:// URLs are supported")
+    host = parsed.hostname or "localhost"
 
-    # prepare configuration
+    cert_path = pathlib.Path(args.certificate)
+    ensure_self_signed(cert_path=cert_path, key_path=DEFAULT_KEY_PATH, host=host)
+
     configuration = QuicConfiguration(
         is_client=True,
-        alpn_protocols=H0_ALPN if args.legacy_http else H3_ALPN,
-        congestion_control_algorithm=args.congestion_control_algorithm,
-        max_datagram_size=args.max_datagram_size,
+        alpn_protocols=H3_ALPN,
+        server_name=host,  # Use hostname for TLS SNI/verification
     )
-    if args.ca_certs:
-        configuration.load_verify_locations(args.ca_certs)
-    if args.cipher_suites:
-        configuration.cipher_suites = [
-            CipherSuite[s] for s in args.cipher_suites.split(",")
-        ]
-    if args.insecure:
-        configuration.verify_mode = ssl.CERT_NONE
-    if args.max_data:
-        configuration.max_data = args.max_data
-    if args.max_stream_data:
-        configuration.max_stream_data = args.max_stream_data
-    if args.negotiate_v2:
-        configuration.original_version = QuicProtocolVersion.VERSION_1
-        configuration.supported_versions = [
-            QuicProtocolVersion.VERSION_2,
-            QuicProtocolVersion.VERSION_1,
-        ]
-    if args.quic_log:
-        configuration.quic_logger = QuicFileLogger(args.quic_log)
-    if args.secrets_log:
-        configuration.secrets_log_file = open(args.secrets_log, "a")
-    if args.session_ticket:
-        try:
-            with open(args.session_ticket, "rb") as fp:
-                configuration.session_ticket = pickle.load(fp)
-        except FileNotFoundError:
-            pass
-
-    # load SSL certificate and key
-    if args.certificate is not None:
-        configuration.load_cert_chain(args.certificate, args.private_key)
+    configuration.load_verify_locations(str(cert_path))
 
     uvloop.install()
     cli = quiccli.QuiCCli(
         send_function=main,
         configuration=configuration,
-        urls=args.url,
-        data=args.data,
-        include=args.include,
-        output_dir=args.output_dir,
-        local_port=args.local_port,
-        zero_rtt=args.zero_rtt,
+        urls=[args.url],
     )
     cli.run_cli()

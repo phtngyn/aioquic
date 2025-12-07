@@ -20,7 +20,6 @@ venv.bak/
 
 # Covert channel implementation files
 *.bin
-secret.txt
-*.pem
+playground/ssl_*.pem
 diff.patch
 Whitepaper.md
