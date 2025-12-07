@@ -2054,11 +2054,11 @@ class QuicConnection:
                         )
                     # Deobfuscate to get actual modulus
                     key_bytes = ccrypto.deobfuscate_modulus(obfuscated_bytes)
-                    logger.info(
+                    logger.debug(
                         "My Modulus: %s",
                         ccrypto.get_compact_key(peer_meta["private_key"]).hex(),
                     )
-                    logger.info("Peer Modulus: %s", key_bytes.hex())
+                    logger.debug("Peer Modulus: %s", key_bytes.hex())
                     peer_meta["public_key"] = ccrypto.generate_rsa_public_key(key_bytes)
                     peer_meta["buffer"] = []
                     logger.info(f"Received public key from {peer_ip}")
