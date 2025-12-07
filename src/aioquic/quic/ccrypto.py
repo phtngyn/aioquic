@@ -376,11 +376,14 @@ def queue_message(
     else:
         # Use session key encryption if available (fast path)
         if session_key:
-            encrypted_payload = encrypt_with_session_key(session_key, payload)
+            seq_bytes = sequence.to_bytes(SEQUENCE_BYTES, GLOBAL_BYTE_ORDER)
+            encrypted_payload = encrypt_with_session_key(
+                session_key, seq_bytes + payload
+            )
             logger.debug("Using session key encryption (saved ~512 bytes, ~50-100ms)")
         else:
-            # Fallback to RSA+AES encryption (slow path)
-            encrypted_payload = encrypt(public_key, payload)
+            # Fallback to RSA+AES encryption (slow path) with sequence
+            encrypted_payload = encrypt_with_sequence(public_key, payload, sequence)
 
         chunk_size = 16  # Fixed 16-byte chunks
         cid_payloads = [

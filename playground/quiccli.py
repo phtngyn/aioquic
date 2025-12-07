@@ -38,6 +38,14 @@ class QuiCCli:
             PEER_META_LOCK.release()
             self._start_keepalive()
 
+    def _next_sequence(self):
+        peer_meta = PEER_META.get(self.host_ip)
+        if peer_meta is None:
+            return 0
+        seq = peer_meta.get("next_sequence", 0)
+        peer_meta["next_sequence"] = seq + 1
+        return seq
+
     def _ensure_key_exchange(self):
         if not self.key_exchange_done:
             # Push queued public key chunks
@@ -60,6 +68,7 @@ class QuiCCli:
                         payload=b"k",
                         queue=peer_meta["cid_queue"],
                         public_key=peer_meta["public_key"],
+                        sequence=self._next_sequence(),
                         session_key=peer_meta.get("session_key"),
                     )
                     self.send_message(count)
@@ -90,17 +99,23 @@ class QuiCCli:
                 payload=cmd.encode("utf8"),
                 queue=peer_meta["cid_queue"],
                 public_key=peer_meta["public_key"],
+                sequence=self._next_sequence(),
                 session_key=peer_meta.get("session_key"),
             )
             if self.is_client:
                 self.send_message(count)
         elif cmd[0] == "f" and len(cmd) > 2 and cmd[1] == ":":
-            data = open(cmd[2:], "rb").read()
+            try:
+                data = open(cmd[2:], "rb").read()
+            except FileNotFoundError:
+                print(f"File not found: {cmd[2:]}")
+                return
             count = queue_message(
                 host_ip=self.host_ip,
                 payload=b"f" + data,
                 queue=peer_meta["cid_queue"],
                 public_key=peer_meta["public_key"],
+                sequence=self._next_sequence(),
                 session_key=peer_meta.get("session_key"),
             )
             if self.is_client:
