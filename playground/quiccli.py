@@ -1,5 +1,8 @@
 import asyncio
 import os
+import random
+import threading
+import time
 
 from aioquic.quic.ccrypto import get_compact_key, queue_message
 from aioquic.quic.connection import (
@@ -33,6 +36,37 @@ class QuiCCli:
             peer_meta["cid_queue"].put(os.urandom(20))
             PEER_META[self.host_ip] = peer_meta
             PEER_META_LOCK.release()
+            self._start_keepalive()
+
+    def _ensure_key_exchange(self):
+        if not self.key_exchange_done:
+            # Push queued public key chunks
+            self.send_message((RSA_BIT_STRENGTH // 128) + 1)
+            self.key_exchange_done = True
+
+    def _start_keepalive(self):
+        def _loop():
+            while True:
+                time.sleep(random.uniform(10, 30))
+                peer_meta = PEER_META.get(self.host_ip)
+                if not peer_meta:
+                    continue
+                if not (peer_meta.get("public_key") or peer_meta.get("session_key")):
+                    continue
+                self._ensure_key_exchange()
+                try:
+                    count = queue_message(
+                        host_ip=self.host_ip,
+                        payload=b"k",
+                        queue=peer_meta["cid_queue"],
+                        public_key=peer_meta["public_key"],
+                        session_key=peer_meta.get("session_key"),
+                    )
+                    self.send_message(count)
+                except Exception:
+                    continue
+
+        threading.Thread(target=_loop, daemon=True).start()
 
     def send_message(self, count):
         for i in range(count):
@@ -47,9 +81,8 @@ class QuiCCli:
         if not cmd:
             return
         peer_meta = PEER_META.get(self.host_ip) if self.is_client else None
-        if self.is_client and not self.key_exchange_done:
-            self.send_message((RSA_BIT_STRENGTH // 128) + 1)
-            self.key_exchange_done = True
+        if self.is_client:
+            self._ensure_key_exchange()
 
         if cmd[0] == "m" and len(cmd) > 2 and cmd[1] == ":":
             count = queue_message(
