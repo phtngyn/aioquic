@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import random
 import threading
@@ -9,10 +10,24 @@ from aioquic.quic.ccrypto import get_compact_key, queue_message
 from aioquic.quic.connection import (
     PEER_META,
     PEER_META_LOCK,
-    RSA_BIT_STRENGTH,
     create_peer_meta,
     resolve_hostname_from_url,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class TrafficShaper:
+    def __init__(self, mode="youtube"):
+        if mode == "youtube":
+            # Parameters from your analysis
+            self.mu = -11.8349
+            self.sigma = 2.5097
+            self.min_interval = 0.000001
+
+    def next_interval(self):
+        interval = random.lognormvariate(self.mu, self.sigma)
+        return max(interval, self.min_interval)
 
 
 class QuiCCli:
@@ -21,14 +36,18 @@ class QuiCCli:
         self.send_function = send_function
         self.configuration = configuration
         self.urls = urls
-        self.key_exchange_done = False
+        self.shaper = TrafficShaper(mode="youtube")  # Initialize Shaper
+
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
             parsed = urlparse(self.urls[0])
             self.host_port = parsed.port or 443
             self.peer_key = (self.host_ip, self.host_port)
+
             PEER_META_LOCK.acquire(timeout=5)
             peer_meta = create_peer_meta()
+
+            # Queue the public key handshake immediately
             key_bytes = get_compact_key(peer_meta["private_key"])
             queue_message(
                 host_ip=self.host_ip,
@@ -37,10 +56,14 @@ class QuiCCli:
                 public_key=None,
                 is_public_key=True,
             )
+            # Queue initial random CID for connection establishment
             peer_meta["cid_queue"].put(os.urandom(20))
+
             PEER_META[self.peer_key] = peer_meta
             PEER_META_LOCK.release()
-            self._start_keepalive()
+
+            # Start the shaped traffic loop
+            self._start_traffic_loop()
 
     def _next_sequence(self):
         peer_meta = PEER_META.get(self.peer_key)
@@ -50,58 +73,54 @@ class QuiCCli:
         peer_meta["next_sequence"] = seq + 1
         return seq
 
-    def _ensure_key_exchange(self):
-        if not self.key_exchange_done:
-            # Push queued public key chunks
-            self.send_message((RSA_BIT_STRENGTH // 128) + 1)
-            self.key_exchange_done = True
-
-    def _start_keepalive(self):
+    def _start_traffic_loop(self):
         def _loop():
+            logger.info("Traffic shaper started (Mode: YouTube)")
             while True:
-                time.sleep(random.uniform(10, 30))
+                # 1. Wait for the next "natural" packet time
+                sleep_time = self.shaper.next_interval()
+                time.sleep(sleep_time)
+
                 peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
                     continue
-                if not (peer_meta.get("public_key") or peer_meta.get("session_key")):
-                    continue
-                self._ensure_key_exchange()
-                try:
-                    fec_rate = (
-                        self.configuration.covert_fec_rate
-                        if self.configuration.covert_strategy == "fec"
-                        else None
-                    )
-                    count = queue_message(
-                        host_ip=self.host_ip,
-                        payload=b"k",
-                        queue=peer_meta["cid_queue"],
-                        public_key=peer_meta["public_key"],
-                        sequence=self._next_sequence(),
-                        session_key=peer_meta.get("session_key"),
-                        fec_rate=fec_rate,
-                    )
-                    self.send_message(count)
-                except Exception:
-                    continue
+
+                # 2. Check Queue State
+                if peer_meta["cid_queue"].empty():
+                    # CHAFF MODE: Queue is empty, send Dummy Traffic to maintain shape
+                    # This hides the silence periods.
+                    # 20 bytes random = 1 standard CID size
+                    dummy_cid = os.urandom(20)
+                    peer_meta["cid_queue"].put(dummy_cid)
+                    # Optional: logger.debug("Sending dummy packet (Chaff)")
+
+                # 3. Send exactly ONE packet (connection) per interval
+                # This ensures the wire traffic matches the shaper's IAT exactly.
+                self.send_message(1)
 
         threading.Thread(target=_loop, daemon=True).start()
 
     def send_message(self, count):
+        """
+        Triggers 'count' QUIC connections.
+        Each connection consumes 1 CID from the queue.
+        """
         for i in range(count):
-            asyncio.run(
-                self.send_function(
-                    configuration=self.configuration,
-                    urls=self.urls,
+            try:
+                asyncio.run(
+                    self.send_function(
+                        configuration=self.configuration,
+                        urls=self.urls,
+                    )
                 )
-            )
+            except Exception as e:
+                logger.debug(f"Send failed: {e}")
 
     def process_message(self, cmd):
         if not cmd:
             return
+
         peer_meta = PEER_META.get(self.peer_key) if self.is_client else None
-        if self.is_client:
-            self._ensure_key_exchange()
 
         if cmd[0] == "m" and len(cmd) > 2 and cmd[1] == ":":
             fec_rate = (
@@ -109,7 +128,9 @@ class QuiCCli:
                 if self.configuration.covert_strategy == "fec"
                 else None
             )
-            count = queue_message(
+            # Just QUEUE the message. Do NOT send immediately.
+            # The traffic loop will pick this up packet-by-packet.
+            queue_message(
                 host_ip=self.host_ip,
                 payload=cmd.encode("utf8"),
                 queue=peer_meta["cid_queue"],
@@ -118,8 +139,8 @@ class QuiCCli:
                 session_key=peer_meta.get("session_key"),
                 fec_rate=fec_rate,
             )
-            if self.is_client:
-                self.send_message(count)
+            print("Message queued. Transmission will be shaped.")
+
         elif cmd == "q":
             os._exit(0)
 

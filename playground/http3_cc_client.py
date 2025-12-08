@@ -24,6 +24,7 @@ from aioquic.h3.events import (
     PushPromiseReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.connection import PEER_META
 from aioquic.quic.events import QuicEvent
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -425,14 +426,44 @@ if __name__ == "__main__":
     )
 
     if args.message:
-        # Auto-send mode: send message and exit
+        # Auto-send mode
         import time
 
-        # Wait for key exchange
-        time.sleep(1)
+        print(f"[*] Starting Traffic Shaper (Strategy: {args.covert_strategy})...")
+
+        # 1. Queue the message
+        # The key exchange is already queued by QuiCCli init
         cli.process_message(f"m:{args.message}")
-        # Wait for message to be sent
-        time.sleep(2)
-        print("Message sent, exiting.")
+
+        # 2. Monitor the Queue
+        # We access the internal queue to verify when it's actually empty
+        print("[*] Waiting for queue to drain...")
+
+        try:
+            while True:
+                # Access the peer state safely
+                peer_meta = PEER_META.get(cli.peer_key)
+                if not peer_meta:
+                    time.sleep(0.5)
+                    continue
+
+                qsize = peer_meta["cid_queue"].qsize()
+
+                if qsize == 0:
+                    print("\n[+] Queue drained.")
+                    break
+
+                print(f"    Remaining packets: {qsize}   ", end="\r")
+                time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            print("\n[!] Aborted by user.")
+
+        # 3. Grace Period
+        # Even after queue is empty, give the network a few seconds to deliver the last packet
+        print("[*] Waiting 5s for final delivery/confirmation...")
+        time.sleep(5)
+        print("[*] Exiting.")
+
     else:
         cli.run_cli()

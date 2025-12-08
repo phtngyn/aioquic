@@ -36,6 +36,8 @@ dependencies = [
     "jinja2>=3.1.6",
     "uvloop>=0.22.1",
     "reedsolo>=1.7.0",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
 ]
 dynamic = ["version"]
 
