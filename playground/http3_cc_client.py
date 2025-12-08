@@ -390,6 +390,12 @@ if __name__ == "__main__":
         default=None,
         help="message to send (auto-send mode, no CLI)",
     )
+    parser.add_argument(
+        "--generate-count",
+        type=int,
+        default=0,
+        help="Run until N packets are generated (for dataset creation)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
 
     args = parser.parse_args()
@@ -425,7 +431,54 @@ if __name__ == "__main__":
         urls=[args.url],
     )
 
-    if args.message:
+    if args.generate_count > 0:
+        import time
+
+        print("[*] Mode: Dataset Generation")
+        print(
+            f"[*] Target: {args.generate_count} packets via Traffic Shaper (Cloudflare Profile)"
+        )
+        print(
+            "[*] Note: This relies on the 'Chaff' mechanism. No message payload required."
+        )
+
+        # Wait for connection init
+        time.sleep(2)
+
+        # Get baseline sequence number
+        peer_meta = PEER_META.get(cli.peer_key)
+        start_seq = peer_meta.get("next_sequence", 0) if peer_meta else 0
+        current_seq = start_seq
+
+        try:
+            while True:
+                peer_meta = PEER_META.get(cli.peer_key)
+                if peer_meta:
+                    current_seq = peer_meta.get("next_sequence", 0)
+
+                packets_sent = current_seq - start_seq
+                remaining = args.generate_count - packets_sent
+
+                # Progress Bar
+                print(
+                    f"    Sent: {packets_sent}/{args.generate_count} | Remaining: {remaining}   ",
+                    end="\r",
+                )
+
+                if packets_sent >= args.generate_count:
+                    print("\n[+] Target reached. Stopping.")
+                    break
+
+                # Wait a bit to let the shaper work (don't busy-wait the CPU)
+                time.sleep(0.5)
+
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted.")
+
+        print("[*] Exiting.")
+        # Optional: Dump the stats
+        print(f"[*] Total Packets Generated: {current_seq - start_seq}")
+    elif args.message:
         # Auto-send mode
         import time
 
@@ -464,6 +517,5 @@ if __name__ == "__main__":
         print("[*] Waiting 5s for final delivery/confirmation...")
         time.sleep(5)
         print("[*] Exiting.")
-
     else:
         cli.run_cli()

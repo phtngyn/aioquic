@@ -1,6 +1,7 @@
 """
 networksetup -listallhardwareports
-sudo tshark -i eth0 -f "udp port 443" -T fields -e frame.time_epoch -E separator=, > youtube_traffic.csv
+sudo tshark -i en0 -a duration:10 -f "udp port 443" -T fields -e frame.time_epoch -E separator=, > real_traffic.csv
+sudo tshark -i lo0 -f "udp port 4433" -T fields -e frame.time_epoch -E separator=, > covert_traffic.csv
 """
 
 import numpy as np
@@ -61,19 +62,6 @@ def calculate_shaping_params(filename):
 
 
 if __name__ == "__main__":
-    calculate_shaping_params("./youtube_traffic.csv")
-
-"""
-========================================
-REFERENCE RESULTS (YouTube 4K Stream)
-========================================
-Total Packets Analyzed: 44,032
-Average IAT:            0.001328 seconds
-
-Recommended TrafficShaper Configuration:
-----------------------------------------
-self.mu = -11.8349
-self.sigma = 2.5097
-self.min_interval = 0.000001
-========================================
-"""
+    calculate_shaping_params("real_traffic.csv")
+    print()
+    calculate_shaping_params("covert_traffic.csv")

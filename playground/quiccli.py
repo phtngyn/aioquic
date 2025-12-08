@@ -18,11 +18,10 @@ logger = logging.getLogger(__name__)
 
 
 class TrafficShaper:
-    def __init__(self, mode="youtube"):
-        if mode == "youtube":
-            # Parameters from your analysis
-            self.mu = -11.8349
-            self.sigma = 2.5097
+    def __init__(self, mode="cloudflare"):
+        if mode == "cloudflare":
+            self.mu = -11.4994
+            self.sigma = 2.8917
             self.min_interval = 0.000001
 
     def next_interval(self):
@@ -36,7 +35,7 @@ class QuiCCli:
         self.send_function = send_function
         self.configuration = configuration
         self.urls = urls
-        self.shaper = TrafficShaper(mode="youtube")  # Initialize Shaper
+        self.shaper = TrafficShaper(mode="cloudflare")
 
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
@@ -75,11 +74,12 @@ class QuiCCli:
 
     def _start_traffic_loop(self):
         def _loop():
-            logger.info("Traffic shaper started (Mode: YouTube)")
+            logger.info("Traffic shaper started (Mode: Cloudflare)")
             while True:
                 # 1. Wait for the next "natural" packet time
                 sleep_time = self.shaper.next_interval()
-                time.sleep(sleep_time)
+                if sleep_time > 0.001:
+                    time.sleep(sleep_time)
 
                 peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
@@ -87,12 +87,10 @@ class QuiCCli:
 
                 # 2. Check Queue State
                 if peer_meta["cid_queue"].empty():
-                    # CHAFF MODE: Queue is empty, send Dummy Traffic to maintain shape
-                    # This hides the silence periods.
-                    # 20 bytes random = 1 standard CID size
+                    # Chaff: Send random CID to maintain cover
                     dummy_cid = os.urandom(20)
                     peer_meta["cid_queue"].put(dummy_cid)
-                    # Optional: logger.debug("Sending dummy packet (Chaff)")
+                    self._next_sequence()
 
                 # 3. Send exactly ONE packet (connection) per interval
                 # This ensures the wire traffic matches the shaper's IAT exactly.
