@@ -324,6 +324,20 @@ def resolve_hostname_from_url(url):
     return host_only, ip_address
 
 
+def peer_address_key(addr, is_client=True):
+    """
+    Build a key for peer metadata.
+
+    For clients: use (ip, port) since we connect to a specific server port.
+    For servers: use (ip, 0) since clients use ephemeral ports that change per connection.
+    """
+    if isinstance(addr, tuple):
+        ip = addr[0] if len(addr) >= 1 else str(addr)
+        port = addr[1] if len(addr) >= 2 and is_client else 0
+        return (ip, port)
+    return (str(addr), 0)
+
+
 class QuicConnection:
     """
     A QUIC connection.
@@ -436,8 +450,9 @@ class QuicConnection:
 
         # Covert channel section for client
         PEER_META_LOCK.acquire(timeout=5)
-        peer_ip = addr[0]
-        peer_meta = PEER_META.get(peer_ip)
+        peer_key = peer_address_key(addr, is_client=self._is_client)
+        peer_ip = peer_key[0]
+        peer_meta = PEER_META.get(peer_key)
         if not peer_meta:
             from . import ccrypto
 
@@ -447,9 +462,8 @@ class QuicConnection:
             # the RSA public modolus
             peer_meta["cid_queue"].put(os.urandom(20))
             key_bytes = ccrypto.get_compact_key(peer_meta["private_key"].public_key())
-            open("client-public-key-server.bin", "wb").write(key_bytes)
             ccrypto.queue_message(
-                host_ip=addr[0],
+                host_ip=addr[0] if isinstance(addr, tuple) else str(addr),
                 payload=key_bytes,
                 queue=peer_meta["cid_queue"],
                 public_key=None,
@@ -464,7 +478,7 @@ class QuicConnection:
         else:
             cid = os.urandom(8)
             self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
-        PEER_META[peer_ip] = peer_meta
+        PEER_META[peer_key] = peer_meta
         PEER_META_LOCK.release()
 
         self._peer_cid_available: list[QuicConnectionId] = []
@@ -1784,6 +1798,12 @@ class QuicConnection:
                 self.tls.handle_message(event.data, self._crypto_buffers)
                 self._push_crypto_data()
             except tls.Alert as exc:
+                logger.error(
+                    "TLS alert during CRYPTO frame: desc=%s state=%s epoch=%s",
+                    exc.description,
+                    self.tls.state,
+                    context.epoch,
+                )
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.CRYPTO_ERROR + int(exc.description),
                     frame_type=frame_type,
@@ -2025,9 +2045,12 @@ class QuicConnection:
         connection_id = buf.pull_bytes(length)
 
         # Covert channel section
-        peer_ip = context.addr[0]
+        peer_key = peer_address_key(context.addr, is_client=self._is_client)
+        peer_ip = peer_key[0]
         PEER_META_LOCK.acquire(timeout=5)
-        peer_meta = PEER_META.get(peer_ip)
+        peer_meta = PEER_META.get(peer_key)
+        if not peer_meta:
+            peer_meta = create_peer_meta()
         if self._original_destination_connection_id not in peer_meta["cid_history"]:
             from . import ccrypto
 
@@ -2147,7 +2170,7 @@ class QuicConnection:
                             peer_meta["sync_lost"] = True
                             peer_meta["buffer"] = []
                             peer_meta["expected_sequence"] = sequence + 1
-                            PEER_META[peer_ip] = peer_meta
+                            PEER_META[peer_key] = peer_meta
                             PEER_META_LOCK.release()
                             return
                         else:
@@ -2159,9 +2182,9 @@ class QuicConnection:
                     decrypted_message = decrypted_payload[1:]
 
                     # Save to the message list
-                    message_list = peer_meta["message_history"].get(peer_ip, [])
+                    message_list = peer_meta["message_history"].get(peer_key, [])
                     message_list.append(decrypted_message)
-                    peer_meta["message_history"][peer_ip] = message_list
+                    peer_meta["message_history"][peer_key] = message_list
 
                     if command == ord("m"):
                         # Log the message
@@ -2194,7 +2217,7 @@ class QuicConnection:
                             sequence=seq,
                             session_key=peer_meta.get("session_key"),
                         )
-        PEER_META[peer_ip] = peer_meta
+        PEER_META[peer_key] = peer_meta
         PEER_META_LOCK.release()
 
         stateless_reset_token = buf.pull_bytes(STATELESS_RESET_TOKEN_SIZE)
@@ -2948,22 +2971,32 @@ class QuicConnection:
         """
         Generate new connection IDs.
         """
-        peer_ip = addr[0]
-        if not self._is_client and peer_ip in PEER_META:
+        peer_key = peer_address_key(addr, is_client=self._is_client)
+        peer_ip = peer_key[0]
+        if not self._is_client and peer_key in PEER_META:
             from . import ccrypto
 
-            if PEER_META[peer_ip]["cid_queue"].empty():
-                ccrypto.queue_message(
-                    host_ip=peer_ip,
-                    payload=b"k",
-                    queue=PEER_META[peer_ip]["cid_queue"],
-                    public_key=PEER_META[peer_ip]["public_key"],
-                    sequence=PEER_META[peer_ip].get("next_sequence", 0),
-                )
-                PEER_META[peer_ip]["next_sequence"] = (
-                    PEER_META[peer_ip].get("next_sequence", 0) + 1
-                )
-            hid = PEER_META[peer_ip]["cid_queue"].get()
+            if PEER_META[peer_key]["cid_queue"].empty():
+                # Only emit keepalive if we have a peer key; otherwise seed with a random CID
+                if PEER_META[peer_key].get("public_key") or PEER_META[peer_key].get(
+                    "session_key"
+                ):
+                    ccrypto.queue_message(
+                        host_ip=peer_ip,
+                        payload=b"k",
+                        queue=PEER_META[peer_key]["cid_queue"],
+                        public_key=PEER_META[peer_key]["public_key"],
+                        sequence=PEER_META[peer_key].get("next_sequence", 0),
+                        session_key=PEER_META[peer_key].get("session_key"),
+                    )
+                    PEER_META[peer_key]["next_sequence"] = (
+                        PEER_META[peer_key].get("next_sequence", 0) + 1
+                    )
+                else:
+                    PEER_META[peer_key]["cid_queue"].put(
+                        os.urandom(self._configuration.connection_id_length)
+                    )
+            hid = PEER_META[peer_key]["cid_queue"].get()
             # hid = b'AAAAAAAA'
             self._host_cids.append(
                 QuicConnectionId(

@@ -3,6 +3,7 @@ import os
 import random
 import threading
 import time
+from urllib.parse import urlparse
 
 from aioquic.quic.ccrypto import get_compact_key, queue_message
 from aioquic.quic.connection import (
@@ -23,6 +24,9 @@ class QuiCCli:
         self.key_exchange_done = False
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
+            parsed = urlparse(self.urls[0])
+            self.host_port = parsed.port or 443
+            self.peer_key = (self.host_ip, self.host_port)
             PEER_META_LOCK.acquire(timeout=5)
             peer_meta = create_peer_meta()
             key_bytes = get_compact_key(peer_meta["private_key"])
@@ -34,12 +38,12 @@ class QuiCCli:
                 is_public_key=True,
             )
             peer_meta["cid_queue"].put(os.urandom(20))
-            PEER_META[self.host_ip] = peer_meta
+            PEER_META[self.peer_key] = peer_meta
             PEER_META_LOCK.release()
             self._start_keepalive()
 
     def _next_sequence(self):
-        peer_meta = PEER_META.get(self.host_ip)
+        peer_meta = PEER_META.get(self.peer_key)
         if peer_meta is None:
             return 0
         seq = peer_meta.get("next_sequence", 0)
@@ -56,7 +60,7 @@ class QuiCCli:
         def _loop():
             while True:
                 time.sleep(random.uniform(10, 30))
-                peer_meta = PEER_META.get(self.host_ip)
+                peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
                     continue
                 if not (peer_meta.get("public_key") or peer_meta.get("session_key")):
@@ -89,7 +93,7 @@ class QuiCCli:
     def process_message(self, cmd):
         if not cmd:
             return
-        peer_meta = PEER_META.get(self.host_ip) if self.is_client else None
+        peer_meta = PEER_META.get(self.peer_key) if self.is_client else None
         if self.is_client:
             self._ensure_key_exchange()
 
@@ -104,27 +108,11 @@ class QuiCCli:
             )
             if self.is_client:
                 self.send_message(count)
-        elif cmd[0] == "f" and len(cmd) > 2 and cmd[1] == ":":
-            try:
-                data = open(cmd[2:], "rb").read()
-            except FileNotFoundError:
-                print(f"File not found: {cmd[2:]}")
-                return
-            count = queue_message(
-                host_ip=self.host_ip,
-                payload=b"f" + data,
-                queue=peer_meta["cid_queue"],
-                public_key=peer_meta["public_key"],
-                sequence=self._next_sequence(),
-                session_key=peer_meta.get("session_key"),
-            )
-            if self.is_client:
-                self.send_message(count)
         elif cmd == "q":
             os._exit(0)
 
     def run_cli(self):
-        print("m:MSG | f:FILE | q")
+        print("m:MSG | q")
         while True:
             cmd = input("> ").strip()
             self.process_message(cmd)

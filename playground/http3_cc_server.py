@@ -542,6 +542,25 @@ if __name__ == "__main__":
         default="playground/ssl_key.pem",
         help="TLS key (auto-generated if missing)",
     )
+    parser.add_argument(
+        "--covert-strategy",
+        type=str,
+        choices=["legacy", "fec"],
+        default="legacy",
+        help="covert mode (default: legacy)",
+    )
+    parser.add_argument(
+        "--fec-rate",
+        type=float,
+        default=0.30,
+        help="FEC parity rate for fec mode",
+    )
+    parser.add_argument(
+        "--fec-timeout",
+        type=float,
+        default=5.0,
+        help="FEC wait seconds before reset",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     args = parser.parse_args()
 
@@ -568,6 +587,9 @@ if __name__ == "__main__":
         is_client=False,
         max_datagram_frame_size=65536,
     )
+    configuration.covert_strategy = args.covert_strategy
+    configuration.covert_fec_rate = args.fec_rate
+    configuration.covert_fec_timeout = args.fec_timeout
     configuration.load_cert_chain(str(certificate), str(private_key))
 
     uvloop.install()

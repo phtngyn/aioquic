@@ -363,6 +363,25 @@ if __name__ == "__main__":
         default=str(DEFAULT_CERT_PATH),
         help="server cert to trust (auto-generated if missing)",
     )
+    parser.add_argument(
+        "--covert-strategy",
+        type=str,
+        choices=["legacy", "fec"],
+        default="legacy",
+        help="covert mode (default: legacy)",
+    )
+    parser.add_argument(
+        "--fec-rate",
+        type=float,
+        default=0.30,
+        help="FEC parity rate for fec mode",
+    )
+    parser.add_argument(
+        "--fec-timeout",
+        type=float,
+        default=5.0,
+        help="FEC wait seconds before reset",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
 
     args = parser.parse_args()
@@ -385,6 +404,9 @@ if __name__ == "__main__":
         alpn_protocols=H3_ALPN,
         server_name=host,  # Use hostname for TLS SNI/verification
     )
+    configuration.covert_strategy = args.covert_strategy
+    configuration.covert_fec_rate = args.fec_rate
+    configuration.covert_fec_timeout = args.fec_timeout
     configuration.load_verify_locations(str(cert_path))
 
     uvloop.install()
