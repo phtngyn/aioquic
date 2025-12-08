@@ -382,6 +382,13 @@ if __name__ == "__main__":
         default=5.0,
         help="FEC wait seconds before reset",
     )
+    parser.add_argument(
+        "--message",
+        "-m",
+        type=str,
+        default=None,
+        help="message to send (auto-send mode, no CLI)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
 
     args = parser.parse_args()
@@ -403,6 +410,7 @@ if __name__ == "__main__":
         is_client=True,
         alpn_protocols=H3_ALPN,
         server_name=host,  # Use hostname for TLS SNI/verification
+        connection_id_length=20,  # Max CID length for covert channel capacity
     )
     configuration.covert_strategy = args.covert_strategy
     configuration.covert_fec_rate = args.fec_rate
@@ -415,4 +423,16 @@ if __name__ == "__main__":
         configuration=configuration,
         urls=[args.url],
     )
-    cli.run_cli()
+
+    if args.message:
+        # Auto-send mode: send message and exit
+        import time
+
+        # Wait for key exchange
+        time.sleep(1)
+        cli.process_message(f"m:{args.message}")
+        # Wait for message to be sent
+        time.sleep(2)
+        print("Message sent, exiting.")
+    else:
+        cli.run_cli()

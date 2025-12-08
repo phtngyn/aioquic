@@ -5,14 +5,12 @@ import importlib.util
 import ipaddress
 import logging
 import pathlib
-import threading
 import time
 from collections import deque
 from email.utils import formatdate
 from typing import Callable, Deque, Dict, List, Optional, Union, cast
 
 import aioquic
-import quiccli
 import uvloop
 import wsproto
 import wsproto.events
@@ -586,6 +584,7 @@ if __name__ == "__main__":
         alpn_protocols=H3_ALPN + H0_ALPN,
         is_client=False,
         max_datagram_frame_size=65536,
+        connection_id_length=20,  # Max CID length for covert channel capacity
     )
     configuration.covert_strategy = args.covert_strategy
     configuration.covert_fec_rate = args.fec_rate
@@ -593,13 +592,8 @@ if __name__ == "__main__":
     configuration.load_cert_chain(str(certificate), str(private_key))
 
     uvloop.install()
-    threading.Thread(
-        target=lambda: asyncio.run(
-            main(host=args.host, port=args.port, configuration=configuration)
-        )
-    ).start()
-
-    cli = quiccli.QuiCCli(
-        is_client=False, send_function=None, configuration=None, urls=None
+    print(
+        f"Server listening on {args.host}:{args.port} (covert_strategy={args.covert_strategy})"
     )
-    cli.run_cli()
+    print("Waiting for covert messages...")
+    asyncio.run(main(host=args.host, port=args.port, configuration=configuration))

@@ -67,6 +67,11 @@ class QuiCCli:
                     continue
                 self._ensure_key_exchange()
                 try:
+                    fec_rate = (
+                        self.configuration.covert_fec_rate
+                        if self.configuration.covert_strategy == "fec"
+                        else None
+                    )
                     count = queue_message(
                         host_ip=self.host_ip,
                         payload=b"k",
@@ -74,6 +79,7 @@ class QuiCCli:
                         public_key=peer_meta["public_key"],
                         sequence=self._next_sequence(),
                         session_key=peer_meta.get("session_key"),
+                        fec_rate=fec_rate,
                     )
                     self.send_message(count)
                 except Exception:
@@ -98,6 +104,11 @@ class QuiCCli:
             self._ensure_key_exchange()
 
         if cmd[0] == "m" and len(cmd) > 2 and cmd[1] == ":":
+            fec_rate = (
+                self.configuration.covert_fec_rate
+                if self.configuration.covert_strategy == "fec"
+                else None
+            )
             count = queue_message(
                 host_ip=self.host_ip,
                 payload=cmd.encode("utf8"),
@@ -105,6 +116,7 @@ class QuiCCli:
                 public_key=peer_meta["public_key"],
                 sequence=self._next_sequence(),
                 session_key=peer_meta.get("session_key"),
+                fec_rate=fec_rate,
             )
             if self.is_client:
                 self.send_message(count)
