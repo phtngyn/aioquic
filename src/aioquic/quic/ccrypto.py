@@ -2,14 +2,14 @@
 import hashlib
 import logging
 import os
-import struct
+import random
 import time
 import zlib
 from random import shuffle
 from typing import Optional, Tuple
 
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -21,7 +21,6 @@ RSA_PUBLIC_EXPONENT = 65537
 AES_BLOCK_SIZE = 16
 GLOBAL_BYTE_ORDER = "big"
 SEQUENCE_BYTES = 2
-MAX_CID_LENGTH = 20
 
 
 def generate_rsa(bits=RSA_BIT_STRENGTH):
@@ -109,31 +108,6 @@ def encrypt_with_sequence(public_key, message: bytes, sequence: int) -> bytes:
     cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
     encryptor = cipher.encryptor()
     compressed_message = zlib.compress(message_with_seq)
-    padded_message = _pad_aes(compressed_message)
-    ciphertext = encryptor.update(padded_message) + encryptor.finalize()
-
-    # Encrypt AES key with RSA
-    encrypted_aes_key = public_key.encrypt(
-        aes_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
-
-    return iv + encrypted_aes_key + ciphertext
-
-
-def encrypt(public_key, message: bytes) -> bytes:
-    """Standard encryption without sequence (backward compatible)."""
-    aes_key = os.urandom(AES_BLOCK_SIZE)
-    iv = os.urandom(AES_BLOCK_SIZE)
-
-    # Encrypt with AES-CBC
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    compressed_message = zlib.compress(message)
     padded_message = _pad_aes(compressed_message)
     ciphertext = encryptor.update(padded_message) + encryptor.finalize()
 
@@ -300,17 +274,6 @@ def try_decrypt(private_key, buffer, raise_on_error=False) -> Optional[bytes]:
         return None
 
 
-def load_key(pem_file):
-    """Load RSA private key from PEM file."""
-    with open(pem_file, "rb") as key_file:
-        private_key = serialization.load_pem_private_key(
-            key_file.read(), password=None, backend=default_backend()
-        )
-        if private_key.key_size != RSA_BIT_STRENGTH:
-            raise Exception(f"This tool requires {RSA_BIT_STRENGTH} bit RSA keys.")
-        return private_key
-
-
 def get_compact_key(rsa_key):
     """Extract N modulus as compact bytes."""
     # Get public numbers from either private or public key
@@ -342,7 +305,6 @@ def queue_message(
     public_key,
     is_public_key=False,
     sequence=0,
-    cid_length=20,
     session_key=None,
 ):
     """
@@ -401,26 +363,9 @@ def queue_message(
 
     for i, cid in enumerate(cid_payloads):
         queue.put(cid)
-        # Add timing jitter (50-200ms) to prevent traffic analysis
-        # Skip delay on last chunk to avoid unnecessary wait
-        # DISABLED for testing - causes server to process incomplete buffers
-        # if i < len(cid_payloads) - 1:
-        #     jitter = random.uniform(0.05, 0.2)
-        #     time.sleep(jitter)
+        if i < len(cid_payloads) - 1:
+            jitter = random.uniform(0.02, 0.05)
+            time.sleep(jitter)
 
     logger.debug(f"Queued {len(cid_payloads)} CID chunks for {host_ip}")
     return len(cid_payloads)
-
-
-def generate_sync_recovery_message() -> bytes:
-    """
-    Generate a sync recovery beacon message.
-
-    Used to re-establish synchronization after disruption.
-    """
-    return b"SYNC_RECOVERY_" + struct.pack(">d", time.time())
-
-
-def is_sync_recovery_message(message: bytes) -> bool:
-    """Check if message is a sync recovery beacon."""
-    return message.startswith(b"SYNC_RECOVERY_")
