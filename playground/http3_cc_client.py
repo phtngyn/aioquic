@@ -63,8 +63,12 @@ def ensure_self_signed(
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(minutes=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .not_valid_before(
+            datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+        )
+        .not_valid_after(
+            datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
+        )
         .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
         .sign(key, hashes.SHA256())
     )
@@ -391,13 +395,13 @@ if __name__ == "__main__":
         help="message to send (auto-send mode, no CLI)",
     )
     parser.add_argument(
-        "--generate-count",
-        type=int,
-        default=0,
-        help="Run until N packets are generated (for dataset creation)",
+        "--traffic-shaper-mode",
+        type=str,
+        choices=["cloudflare", "none"],
+        default="none",
+        help="traffic mode (default: none)",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
-
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -423,6 +427,7 @@ if __name__ == "__main__":
     configuration.covert_fec_rate = args.fec_rate
     configuration.covert_fec_timeout = args.fec_timeout
     configuration.load_verify_locations(str(cert_path))
+    configuration.traffic_shaper_mode = args.traffic_shaper_mode
 
     uvloop.install()
     cli = quiccli.QuiCCli(
@@ -432,7 +437,6 @@ if __name__ == "__main__":
     )
 
     if args.message:
-        # Auto-send mode
         import time
 
         print(f"[*] Starting Traffic Shaper (Strategy: {args.covert_strategy})...")

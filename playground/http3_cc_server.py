@@ -62,8 +62,12 @@ def ensure_self_signed(
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime.utcnow() - datetime.timedelta(minutes=1))
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .not_valid_before(
+            datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=1)
+        )
+        .not_valid_after(
+            datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)
+        )
         .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
         .sign(key, hashes.SHA256())
     )
@@ -583,7 +587,7 @@ if __name__ == "__main__":
         alpn_protocols=H3_ALPN + H0_ALPN,
         is_client=False,
         max_datagram_frame_size=65536,
-        connection_id_length=20,  # Max CID length for covert channel capacity
+        connection_id_length=20,
     )
     configuration.covert_strategy = args.covert_strategy
     configuration.covert_fec_rate = args.fec_rate

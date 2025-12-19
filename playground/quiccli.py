@@ -6,7 +6,7 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from aioquic.quic.ccrypto import get_compact_key, queue_message
+from aioquic.quic.ccrypto import SEQUENCE_BYTES, get_compact_key, queue_message
 from aioquic.quic.connection import (
     PEER_META,
     PEER_META_LOCK,
@@ -19,12 +19,17 @@ logger = logging.getLogger(__name__)
 
 class TrafficShaper:
     def __init__(self, mode="cloudflare"):
+        self.mode = mode
         if mode == "cloudflare":
             self.mu = -11.4994
             self.sigma = 2.8917
             self.min_interval = 0.000001
+        elif mode == "none":
+            self.min_interval = 0
 
     def next_interval(self):
+        if self.mode == "none":
+            return 0
         interval = random.lognormvariate(self.mu, self.sigma)
         return max(interval, self.min_interval)
 
@@ -35,7 +40,13 @@ class QuiCCli:
         self.send_function = send_function
         self.configuration = configuration
         self.urls = urls
-        self.shaper = TrafficShaper(mode="cloudflare")
+
+        self.shaper_mode = getattr(configuration, "traffic_shaper_mode", "none")
+        self.shaper = TrafficShaper(mode=self.shaper_mode)
+
+        self._stop_event = threading.Event()
+        self._traffic_thread = None
+        self.peer_key = None
 
         if self.is_client:
             self.host, self.host_ip = resolve_hostname_from_url(self.urls[0])
@@ -61,25 +72,35 @@ class QuiCCli:
             PEER_META[self.peer_key] = peer_meta
             PEER_META_LOCK.release()
 
-            # Start the shaped traffic loop
-            self._start_traffic_loop()
+            if self.shaper_mode != "none":
+                self._start_traffic_loop()
+            else:
+                qsize = peer_meta["cid_queue"].qsize()
+                if qsize > 0:
+                    self.send_message(qsize)
 
     def _next_sequence(self):
         peer_meta = PEER_META.get(self.peer_key)
         if peer_meta is None:
             return 0
         seq = peer_meta.get("next_sequence", 0)
-        peer_meta["next_sequence"] = seq + 1
+        modulo = 1 << (SEQUENCE_BYTES * 8)
+        peer_meta["next_sequence"] = (seq + 1) % modulo
         return seq
 
     def _start_traffic_loop(self):
         def _loop():
-            logger.info("Traffic shaper started (Mode: Cloudflare)")
-            while True:
+            logger.info(f"Traffic shaper started (Mode: {self.shaper_mode})")
+            while not self._stop_event.is_set():
                 # 1. Wait for the next "natural" packet time
                 sleep_time = self.shaper.next_interval()
-                if sleep_time > 0.001:
-                    time.sleep(sleep_time)
+                if sleep_time > 0:
+                    deadline = time.monotonic() + sleep_time
+                    while not self._stop_event.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        time.sleep(min(0.1, remaining))
 
                 peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
@@ -90,13 +111,15 @@ class QuiCCli:
                     # Chaff: Send random CID to maintain cover
                     dummy_cid = os.urandom(20)
                     peer_meta["cid_queue"].put(dummy_cid)
-                    self._next_sequence()
 
                 # 3. Send exactly ONE packet (connection) per interval
                 # This ensures the wire traffic matches the shaper's IAT exactly.
                 self.send_message(1)
 
-        threading.Thread(target=_loop, daemon=True).start()
+            logger.info("Traffic shaper stopped")
+
+        self._traffic_thread = threading.Thread(target=_loop, name="quic-shaper")
+        self._traffic_thread.start()
 
     def send_message(self, count):
         """
@@ -116,7 +139,7 @@ class QuiCCli:
 
     def process_message(self, cmd):
         if not cmd:
-            return
+            return True
 
         peer_meta = PEER_META.get(self.peer_key) if self.is_client else None
 
@@ -126,9 +149,8 @@ class QuiCCli:
                 if self.configuration.covert_strategy == "fec"
                 else None
             )
-            # Just QUEUE the message. Do NOT send immediately.
-            # The traffic loop will pick this up packet-by-packet.
-            queue_message(
+            # Just QUEUE the message.
+            count = queue_message(
                 host_ip=self.host_ip,
                 payload=cmd.encode("utf8"),
                 queue=peer_meta["cid_queue"],
@@ -137,13 +159,37 @@ class QuiCCli:
                 session_key=peer_meta.get("session_key"),
                 fec_rate=fec_rate,
             )
-            print("Message queued. Transmission will be shaped.")
+
+            if self.shaper_mode != "none":
+                print("Message queued. Transmission will be shaped.")
+            else:
+                # Immediate Send Mode
+                print(f"Message queued. Sending {count} packets immediately...")
+                self.send_message(count)
 
         elif cmd == "q":
-            os._exit(0)
+            self.stop()
+            return False
+
+        return True
+
+    def stop(self):
+        """Signal background loop to exit and wait briefly for shutdown."""
+        if self._stop_event.is_set():
+            return
+
+        self._stop_event.set()
+        if self._traffic_thread and self._traffic_thread.is_alive():
+            self._traffic_thread.join(timeout=2.0)
+        logger.info("QuiCCli stopped")
 
     def run_cli(self):
         print("m:MSG | q")
-        while True:
-            cmd = input("> ").strip()
-            self.process_message(cmd)
+        while not self._stop_event.is_set():
+            try:
+                cmd = input("> ").strip()
+            except EOFError:
+                self.stop()
+                break
+            if not self.process_message(cmd):
+                break
