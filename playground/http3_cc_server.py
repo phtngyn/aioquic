@@ -32,7 +32,6 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-AsgiApplication = Callable
 HttpConnection = Union[H0Connection, H3Connection]
 
 SERVER_NAME = "aioquic/" + aioquic.__version__
@@ -116,7 +115,7 @@ class HttpRequestHandler:
                 {"type": "http.request", "body": b"", "more_body": False}
             )
 
-    async def run_asgi(self, app: AsgiApplication) -> None:
+    async def run_asgi(self, app: Callable) -> None:
         await app(self.scope, self.receive, self.send)
 
     async def receive(self) -> Dict:
@@ -204,7 +203,7 @@ class WebSocketHandler:
         elif isinstance(event, wsproto.events.CloseConnection):
             self.queue.put_nowait({"type": "websocket.disconnect", "code": event.code})
 
-    async def run_asgi(self, app: AsgiApplication) -> None:
+    async def run_asgi(self, app: Callable) -> None:
         self.queue.put_nowait({"type": "websocket.connect"})
 
         try:
@@ -307,7 +306,7 @@ class WebTransportHandler:
                 # from the ASGI application
                 self.http_event_queue.append(event)
 
-    async def run_asgi(self, app: AsgiApplication) -> None:
+    async def run_asgi(self, app: Callable) -> None:
         self.queue.put_nowait({"type": "webtransport.connect"})
 
         try:

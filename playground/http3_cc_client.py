@@ -416,8 +416,8 @@ if __name__ == "__main__":
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=H3_ALPN,
-        server_name=host,  # Use hostname for TLS SNI/verification
-        connection_id_length=20,  # Max CID length for covert channel capacity
+        server_name=host,
+        connection_id_length=20,
     )
     configuration.covert_strategy = args.covert_strategy
     configuration.covert_fec_rate = args.fec_rate
@@ -431,70 +431,16 @@ if __name__ == "__main__":
         urls=[args.url],
     )
 
-    if args.generate_count > 0:
-        import time
-
-        print("[*] Mode: Dataset Generation")
-        print(
-            f"[*] Target: {args.generate_count} packets via Traffic Shaper (Cloudflare Profile)"
-        )
-        print(
-            "[*] Note: This relies on the 'Chaff' mechanism. No message payload required."
-        )
-
-        # Wait for connection init
-        time.sleep(2)
-
-        # Get baseline sequence number
-        peer_meta = PEER_META.get(cli.peer_key)
-        start_seq = peer_meta.get("next_sequence", 0) if peer_meta else 0
-        current_seq = start_seq
-
-        try:
-            while True:
-                peer_meta = PEER_META.get(cli.peer_key)
-                if peer_meta:
-                    current_seq = peer_meta.get("next_sequence", 0)
-
-                packets_sent = current_seq - start_seq
-                remaining = args.generate_count - packets_sent
-
-                # Progress Bar
-                print(
-                    f"    Sent: {packets_sent}/{args.generate_count} | Remaining: {remaining}   ",
-                    end="\r",
-                )
-
-                if packets_sent >= args.generate_count:
-                    print("\n[+] Target reached. Stopping.")
-                    break
-
-                # Wait a bit to let the shaper work (don't busy-wait the CPU)
-                time.sleep(0.5)
-
-        except KeyboardInterrupt:
-            print("\n[!] Interrupted.")
-
-        print("[*] Exiting.")
-        # Optional: Dump the stats
-        print(f"[*] Total Packets Generated: {current_seq - start_seq}")
-    elif args.message:
+    if args.message:
         # Auto-send mode
         import time
 
         print(f"[*] Starting Traffic Shaper (Strategy: {args.covert_strategy})...")
 
-        # 1. Queue the message
-        # The key exchange is already queued by QuiCCli init
         cli.process_message(f"m:{args.message}")
-
-        # 2. Monitor the Queue
-        # We access the internal queue to verify when it's actually empty
-        print("[*] Waiting for queue to drain...")
 
         try:
             while True:
-                # Access the peer state safely
                 peer_meta = PEER_META.get(cli.peer_key)
                 if not peer_meta:
                     time.sleep(0.5)
@@ -512,8 +458,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[!] Aborted by user.")
 
-        # 3. Grace Period
-        # Even after queue is empty, give the network a few seconds to deliver the last packet
         print("[*] Waiting 5s for final delivery/confirmation...")
         time.sleep(5)
         print("[*] Exiting.")

@@ -9,7 +9,7 @@ def extract_features(filename, label):
     try:
         df = pd.read_csv(filename, header=None, names=["timestamp"])
         iat = df["timestamp"].diff().dropna()
-    except:
+    except Exception:
         return []
 
     WINDOW_SIZE = 20
