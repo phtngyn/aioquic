@@ -401,6 +401,18 @@ if __name__ == "__main__":
         default="none",
         help="traffic mode (default: none)",
     )
+    parser.add_argument(
+        "--sliding-window-depth",
+        type=int,
+        default=5,
+        help="max legacy buffer drops per recovery attempt (default: 5)",
+    )
+    parser.add_argument(
+        "--metrics-log-interval",
+        type=int,
+        default=10,
+        help="log covert metrics every N messages (default: 10)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     args = parser.parse_args()
 
@@ -428,6 +440,8 @@ if __name__ == "__main__":
     configuration.covert_fec_timeout = args.fec_timeout
     configuration.load_verify_locations(str(cert_path))
     configuration.traffic_shaper_mode = args.traffic_shaper_mode
+    configuration.covert_window_depth = max(0, args.sliding_window_depth)
+    configuration.covert_log_interval = max(1, args.metrics_log_interval)
 
     uvloop.install()
     cli = quiccli.QuiCCli(

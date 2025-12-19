@@ -197,6 +197,14 @@ def create_peer_meta():
         "connection_count": 0,  # Support multiple concurrent connections
         "session_key": session_key,  # Phase 2: Fast session encryption
         "session_message_count": 0,  # Track messages for key rotation
+        "metrics": {
+            "msgs_recovered": 0,
+            "seq_gaps": 0,
+            "dropped_packets_est": 0,
+            "decryption_failures": 0,
+            "buffer_flushes": 0,
+            "sliding_window_hits": 0,
+        },
     }
 
 
@@ -1419,6 +1427,23 @@ class QuicConnection:
         """
         End the close procedure.
         """
+        if PEER_META_LOCK.acquire(timeout=5):
+            try:
+                for key, meta in PEER_META.items():
+                    metrics = meta.get("metrics") if isinstance(meta, dict) else None
+                    if metrics and metrics.get("msgs_recovered"):
+                        logger.info(
+                            "FINAL covert report %s: recovered=%d lost_est=%d gaps=%d decrypt_failures=%d sliding=%d flushes=%d",
+                            key,
+                            metrics["msgs_recovered"],
+                            metrics["dropped_packets_est"],
+                            metrics["seq_gaps"],
+                            metrics["decryption_failures"],
+                            metrics["sliding_window_hits"],
+                            metrics["buffer_flushes"],
+                        )
+            finally:
+                PEER_META_LOCK.release()
         self._close_at = None
         for epoch in self._spaces.keys():
             self._discard_epoch(epoch)
@@ -2090,6 +2115,9 @@ class QuicConnection:
                     buffer_age,
                     len(peer_meta["buffer"]),
                 )
+                metrics = peer_meta.get("metrics")
+                if metrics is not None:
+                    metrics["buffer_flushes"] += 1
                 peer_meta["buffer"] = []
                 peer_meta["buffer_timestamp"] = now_ts
 
@@ -2112,11 +2140,29 @@ class QuicConnection:
 
             # --- Data Processing (Loop to Drain Buffer) ---
             else:
+                metrics = peer_meta.get("metrics")
+                if metrics is None:
+                    metrics = peer_meta["metrics"] = {
+                        "msgs_recovered": 0,
+                        "seq_gaps": 0,
+                        "dropped_packets_est": 0,
+                        "decryption_failures": 0,
+                        "buffer_flushes": 0,
+                        "sliding_window_hits": 0,
+                    }
+                max_retries = max(
+                    0, getattr(self._configuration, "covert_window_depth", 5)
+                )
+                metrics_interval = max(
+                    1, getattr(self._configuration, "covert_log_interval", 10)
+                )
+                retry_attempts = 0
                 while True:
                     sequence = None
                     decrypted_payload = None
                     encrypted_payload = None
                     decoded_msg_id = None
+                    using_sliding_window = False
 
                     # 1. Attempt Reconstruct
                     if self._configuration.covert_strategy == "fec":
@@ -2223,6 +2269,17 @@ class QuicConnection:
                             if result:
                                 decrypted_payload, sequence = result
                             else:
+                                if (
+                                    max_retries > 0
+                                    and retry_attempts < max_retries
+                                    and len(peer_meta["buffer"]) > 1
+                                ):
+                                    if metrics is not None:
+                                        metrics["decryption_failures"] += 1
+                                    peer_meta["buffer"].pop(0)
+                                    retry_attempts += 1
+                                    using_sliding_window = True
+                                    continue
                                 result_noseq = ccrypto.try_decrypt(
                                     peer_meta["private_key"],
                                     peer_meta["buffer"],
@@ -2247,15 +2304,48 @@ class QuicConnection:
                             elif sequence < expected:
                                 valid_seq = False
                             elif sequence != expected:
-                                peer_meta["sync_lost"] = True
+                                gap = sequence - expected
+                                if metrics is not None:
+                                    metrics["seq_gaps"] += 1
+                                    metrics["dropped_packets_est"] += gap
+                                logger.warning(
+                                    "Sequence gap detected for %s: expected %d got %d (lost %d)",
+                                    peer_ip,
+                                    expected,
+                                    sequence,
+                                    gap,
+                                )
                                 peer_meta["expected_sequence"] = sequence + 1
-                                valid_seq = False
+                                peer_meta["sync_lost"] = False
+                                valid_seq = True
                             else:
                                 peer_meta["expected_sequence"] = expected + 1
                                 peer_meta["sync_lost"] = False
 
                         if valid_seq:
+                            sliding_used = retry_attempts > 0
+                            retry_attempts = 0
+                            if metrics is not None:
+                                metrics["msgs_recovered"] += 1
+                                if sliding_used:
+                                    metrics["sliding_window_hits"] += 1
+                                if (
+                                    metrics_interval > 0
+                                    and metrics["msgs_recovered"] % metrics_interval
+                                    == 0
+                                ):
+                                    logger.info(
+                                        "Covert metrics %s: recovered=%d lost_est=%d gaps=%d decrypt_failures=%d sliding=%d flushes=%d",
+                                        peer_ip,
+                                        metrics["msgs_recovered"],
+                                        metrics["dropped_packets_est"],
+                                        metrics["seq_gaps"],
+                                        metrics["decryption_failures"],
+                                        metrics["sliding_window_hits"],
+                                        metrics["buffer_flushes"],
+                                    )
                             peer_meta["buffer_timestamp"] = time.time()
+                            peer_meta["last_sync_time"] = peer_meta["buffer_timestamp"]
                             command = decrypted_payload[0]
                             decrypted_message = decrypted_payload[1:]
 
@@ -2297,6 +2387,10 @@ class QuicConnection:
                                     session_key=peer_meta.get("session_key"),
                                     fec_rate=fec_rate,
                                 )
+                    else:
+                        if metrics is not None:
+                            metrics["decryption_failures"] += 1
+                        break
 
                     if self._configuration.covert_strategy != "fec":
                         # In Legacy mode, if we didn't decrypt, we keep the buffer and break.

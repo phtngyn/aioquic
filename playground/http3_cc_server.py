@@ -562,6 +562,18 @@ if __name__ == "__main__":
         default=5.0,
         help="FEC wait seconds before reset",
     )
+    parser.add_argument(
+        "--sliding-window-depth",
+        type=int,
+        default=5,
+        help="max legacy buffer drops per recovery attempt (default: 5)",
+    )
+    parser.add_argument(
+        "--metrics-log-interval",
+        type=int,
+        default=10,
+        help="log covert metrics every N messages (default: 10)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     args = parser.parse_args()
 
@@ -592,6 +604,8 @@ if __name__ == "__main__":
     configuration.covert_strategy = args.covert_strategy
     configuration.covert_fec_rate = args.fec_rate
     configuration.covert_fec_timeout = args.fec_timeout
+    configuration.covert_window_depth = max(0, args.sliding_window_depth)
+    configuration.covert_log_interval = max(1, args.metrics_log_interval)
     configuration.load_cert_chain(str(certificate), str(private_key))
 
     uvloop.install()

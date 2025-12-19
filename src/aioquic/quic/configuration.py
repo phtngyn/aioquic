@@ -54,6 +54,16 @@ class QuicConfiguration:
     Seconds to wait for missing shards before giving up in FEC mode.
     """
 
+    covert_window_depth: int = 5
+    """
+    Maximum number of legacy shards to drop during passive sync recovery.
+    """
+
+    covert_log_interval: int = 10
+    """
+    Emit covert metrics every N recovered messages.
+    """
+
     idle_timeout: float = 60.0
     """
     The idle timeout in seconds.
