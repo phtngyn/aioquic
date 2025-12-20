@@ -1,5 +1,5 @@
 {
-  "timestamp": 1766231999.7813609,
+  "timestamp": 1766258806.141008,
   "messages": [
     "Meet at dawn by the old pier.",
     "Supplies arrived safely at warehouse three.",
@@ -31,11 +31,11 @@
       "expected": 10
     },
     "03_FEC_0.2_vs_25Loss": {
-      "recovered": 9,
+      "recovered": 8,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
-      "drops": 1,
+      "drops": 2,
       "expected": 10
     },
     "04_FEC_0.5_vs_25Loss": {
@@ -47,35 +47,35 @@
       "expected": 10
     },
     "05_FEC_Sweep_0.30": {
-      "recovered": 5,
+      "recovered": 6,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
-      "drops": 5,
+      "drops": 4,
       "expected": 10
     },
     "05_FEC_Sweep_0.40": {
-      "recovered": 7,
-      "decrypt_failures": 0,
-      "gaps": 0,
-      "flushes": 0,
-      "drops": 3,
-      "expected": 10
-    },
-    "05_FEC_Sweep_0.50": {
-      "recovered": 5,
-      "decrypt_failures": 0,
-      "gaps": 0,
-      "flushes": 0,
-      "drops": 5,
-      "expected": 10
-    },
-    "05_FEC_Sweep_0.60": {
       "recovered": 8,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
       "drops": 2,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.50": {
+      "recovered": 6,
+      "decrypt_failures": 0,
+      "gaps": 1,
+      "flushes": 0,
+      "drops": 4,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.60": {
+      "recovered": 6,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 4,
       "expected": 10
     },
     "05_FEC_Sweep_0.70": {
@@ -87,11 +87,11 @@
       "expected": 10
     },
     "05_FEC_Sweep_0.80": {
-      "recovered": 5,
+      "recovered": 6,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
-      "drops": 5,
+      "drops": 4,
       "expected": 10
     },
     "05_FEC_Sweep_0.90": {
@@ -127,8 +127,8 @@
         "drops": 9
       },
       "fec": {
-        "recovered": 10,
-        "drops": 0
+        "recovered": 8,
+        "drops": 2
       }
     },
     {
@@ -138,8 +138,8 @@
         "drops": 9
       },
       "fec": {
-        "recovered": 9,
-        "drops": 1
+        "recovered": 8,
+        "drops": 2
       }
     },
     {
@@ -160,8 +160,8 @@
         "drops": 9
       },
       "fec": {
-        "recovered": 4,
-        "drops": 6
+        "recovered": 7,
+        "drops": 3
       }
     }
   ],
@@ -171,23 +171,23 @@
     "results": [
       {
         "rate": 0.3,
-        "recovered": 5,
-        "drops": 5
+        "recovered": 6,
+        "drops": 4
       },
       {
         "rate": 0.4,
-        "recovered": 7,
-        "drops": 3
+        "recovered": 8,
+        "drops": 2
       },
       {
         "rate": 0.5,
-        "recovered": 5,
-        "drops": 5
+        "recovered": 6,
+        "drops": 4
       },
       {
         "rate": 0.6,
-        "recovered": 8,
-        "drops": 2
+        "recovered": 6,
+        "drops": 4
       },
       {
         "rate": 0.7,
@@ -196,8 +196,8 @@
       },
       {
         "rate": 0.8,
-        "recovered": 5,
-        "drops": 5
+        "recovered": 6,
+        "drops": 4
       },
       {
         "rate": 0.9,
@@ -212,7 +212,7 @@
     "grace_period": 5.0
   },
   "throughput": {
-    "legacy_time": 17.530039072036743,
-    "fec_time": 17.53494119644165
+    "legacy_time": 17.52789306640625,
+    "fec_time": 17.542609214782715
   }
 }

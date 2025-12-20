@@ -59,8 +59,26 @@ def _mask_bytes(data: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, mask))
 
 
-def fec_encode(data: bytes, fec_rate: float = 0.30) -> List[bytes]:
-    """Encode data using Interleaved Reed-Solomon with Random IDs."""
+def _get_header_mask(
+    session_key: Optional[bytes], msg_id: int, length: int = 3
+) -> bytes:
+    """
+    Derives a mask to obfuscate FEC headers using the Session Key and Message ID.
+    If no session key is established (Handshake), returns null mask (Plaintext).
+    """
+    if not session_key:
+        return b"\x00" * length
+    # HMAC-style construction: Hash(Key + Salt)
+    digest = hashlib.sha256(session_key + bytes([msg_id])).digest()
+    return digest[:length]
+
+
+def fec_encode(
+    data: bytes, fec_rate: float = 0.30, session_key: Optional[bytes] = None
+) -> List[bytes]:
+    """
+    Encode data using Interleaved Reed-Solomon with Header Obfuscation.
+    """
     if not data:
         return []
     if len(data) > MAX_FEC_PAYLOAD:
@@ -90,13 +108,21 @@ def fec_encode(data: bytes, fec_rate: float = 0.30) -> List[bytes]:
     total_shards = n_data + n_parity
     result = []
 
-    # --- CRITICAL FIX: Use Random ID to prevent collisions ---
+    # 1. Generate Random Message ID (Public Salt)
     msg_id = random.randint(0, 255)
-    # ---------------------------------------------------------
+
+    # 2. Derive Mask for Metadata (n_data, n_parity, shard_idx)
+    header_mask = _get_header_mask(session_key, msg_id)
 
     for shard_idx in range(total_shards):
         chunk = bytes(shards[pos][shard_idx] for pos in range(FEC_CHUNK_SIZE))
-        header = bytes([msg_id, n_data, n_parity, shard_idx])
+
+        # 3. Obfuscate Metadata
+        meta = bytes([n_data, n_parity, shard_idx])
+        masked_meta = bytes(a ^ b for a, b in zip(meta, header_mask))
+
+        # Header = [Plaintext MsgID] + [Encrypted Metadata]
+        header = bytes([msg_id]) + masked_meta
         result.append(header + chunk)
 
     logger.debug(f"FEC Encoded: {len(data)}B -> {total_shards} CIDs (ID={msg_id})")
@@ -104,10 +130,11 @@ def fec_encode(data: bytes, fec_rate: float = 0.30) -> List[bytes]:
 
 
 def fec_decode(
-    shards: List[bytes], fec_rate: float = 0.30
+    shards: List[bytes], fec_rate: float = 0.30, session_key: Optional[bytes] = None
 ) -> Optional[Tuple[bytes, int]]:
     """
-    Decode interleaved shards. Returns (payload, msg_id).
+    Decode interleaved shards with Header De-obfuscation.
+    Returns (payload, msg_id).
     """
     if not shards:
         return None
@@ -116,13 +143,29 @@ def fec_decode(
 
     for s in shards:
         if s and len(s) >= 4 + FEC_CHUNK_SIZE:
-            msg_id, n_data, n_parity, shard_idx = s[0], s[1], s[2], s[3]
+            msg_id = s[0]
+
+            # 1. Derive Mask to unlock Metadata
+            mask = _get_header_mask(session_key, msg_id)
+
+            # 2. De-obfuscate
+            encrypted_meta = s[1:4]
+            meta = bytes(a ^ b for a, b in zip(encrypted_meta, mask))
+
+            n_data, n_parity, shard_idx = meta[0], meta[1], meta[2]
+
+            # 3. Sanity Check (Filters out garbage/wrong keys)
             if n_data == 0 or n_parity == 0 or (n_data + n_parity) > 255:
                 continue
+
             key = (msg_id, n_data, n_parity)
             if key not in clusters:
                 clusters[key] = []
-            clusters[key].append(s)
+
+            # Attach the clean metadata for the decoder
+            # Structure: [msg_id, n_data, n_parity, shard_idx] + [payload]
+            clean_packet = bytes([msg_id, n_data, n_parity, shard_idx]) + s[4:]
+            clusters[key].append(clean_packet)
 
     for (msg_id, n_data, n_parity), cluster_shards in clusters.items():
         if len(cluster_shards) < n_data:
@@ -140,7 +183,7 @@ def fec_decode(
             if all(i in shard_map for i in range(n_data)):
                 result = b"".join(shard_map[i] for i in range(n_data))
                 result = result.rstrip(b"\x00")
-                return (result, msg_id)  # Return Tuple
+                return (result, msg_id)
 
             # RECOVERY PATH
             result_chunks = [bytearray(FEC_CHUNK_SIZE) for _ in range(n_data)]
@@ -163,7 +206,7 @@ def fec_decode(
 
             result = b"".join(bytes(c) for c in result_chunks)
             result = result.rstrip(b"\x00")
-            return (result, msg_id)  # Return Tuple
+            return (result, msg_id)
 
         except (ReedSolomonError, ValueError):
             continue
@@ -234,11 +277,13 @@ def reconstruct_payload(buffer):
     return b"".join(payload_chunks)
 
 
-def reconstruct_payload_fec(buffer, fec_rate: float = 0.30):
+def reconstruct_payload_fec(
+    buffer, fec_rate: float = 0.30, session_key: Optional[bytes] = None
+):
     """Reconstructs payload directly from FEC headers."""
     if not buffer:
         return None
-    return fec_decode(buffer, fec_rate)
+    return fec_decode(buffer, fec_rate=fec_rate, session_key=session_key)
 
 
 def encrypt_with_session_key(session_key: bytes, message: bytes) -> bytes:
@@ -295,6 +340,7 @@ def queue_message(
     target_payload = b""
     if is_public_key:
         target_payload = encode_public_key_payload(payload)
+        # Disable FEC for Handshake to avoid complexity before key establishment
         if fec_rate and len(target_payload) > MAX_FEC_PAYLOAD:
             logger.warning("Handshake payload too large for FEC; disabling FEC.")
             fec_rate = None
@@ -312,8 +358,10 @@ def queue_message(
         fec_rate = None
 
     if fec_rate and fec_rate > 0:
-        cid_payloads = fec_encode(target_payload, fec_rate)
+        # Pass session_key for Header Obfuscation
+        cid_payloads = fec_encode(target_payload, fec_rate, session_key=session_key)
     else:
+        # Legacy Mode (Vulnerable to Prefix Leak - Recommended to use FEC)
         chunk_size = 16
         raw_chunks = [
             target_payload[i : i + chunk_size]

@@ -2201,7 +2201,9 @@ class QuicConnection:
                             continue
 
                         result = ccrypto.reconstruct_payload_fec(
-                            remaining_buffer, self._configuration.covert_fec_rate
+                            remaining_buffer,
+                            self._configuration.covert_fec_rate,
+                            session_key=peer_meta.get("session_key"),
                         )
 
                         if result and isinstance(result, tuple):
