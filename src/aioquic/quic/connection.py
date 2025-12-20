@@ -7,7 +7,6 @@ import socket
 import subprocess
 import threading
 import time
-import zlib
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -21,12 +20,6 @@ from typing import (
     Sequence,
     Set,
 )
-
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import padding as sym_padding
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .. import tls
 from ..buffer import (
@@ -120,9 +113,6 @@ STOP_SENDING_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE
 STREAMS_BLOCKED_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
 
-RSA_BIT_STRENGTH = 4096
-RSA_PUBLIC_EXPONENT = 0x10001
-AES_BLOCK_SIZE = 16
 GLOBAL_BYTE_ORDER = "big"
 RSA_PRIVATE_KEY = None
 CID_HISTORY_LENGTH = 16
@@ -133,7 +123,7 @@ REMOTE_COMMANDS_ENABLED = False
 MAX_CID_LENGTH = 20
 SEQUENCE_BYTES = 2
 SYNC_RECOVERY_TIMEOUT = 30.0
-MAX_BUFFER_AGE = 60.0  # UPDATED: Reduced to 5.0s for academic reliability metrics
+MAX_BUFFER_AGE = 60.0
 
 
 def EPOCHS(shortcut: str) -> FrozenSet[tls.Epoch]:
@@ -167,36 +157,30 @@ def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
         return tls.Epoch.ONE_RTT
 
 
-def _unpad_aes(data: bytes) -> bytes:
-    unpadder = sym_padding.PKCS7(128).unpadder()
-    return unpadder.update(data) + unpadder.finalize()
-
-
 def create_peer_meta():
-    import hashlib
-
     from . import ccrypto
 
-    # Generate session key from pre-shared secret (for testing Phase 2)
-    # In production, this would be exchanged securely
-    PRE_SHARED_SECRET = b"QuiCC_Phase2_Test_Secret_2024"
-    session_key = hashlib.sha256(PRE_SHARED_SECRET).digest()  # 32 bytes for AES-256
+    private_key = ccrypto.generate_private_key()
+    local_public_key = ccrypto.get_public_key_bytes(private_key)
 
     return {
         "buffer": [],
-        "public_key": None,
+        "public_key": None,  # Remote Curve25519 public key bytes
+        "local_public_key": local_public_key,
         "message_history": {},
         "cid_queue": queue.Queue(),
         "cid_history": [],
-        "private_key": ccrypto.generate_rsa(),
+        "private_key": private_key,
         "expected_sequence": 0,  # Track expected sequence for sync
         "next_sequence": 0,  # Outgoing sequence counter
         "last_sync_time": 0.0,  # Track last successful sync
         "buffer_timestamp": 0.0,  # Track buffer age
         "sync_lost": False,  # Flag indicating sync loss
         "connection_count": 0,  # Support multiple concurrent connections
-        "session_key": session_key,  # Phase 2: Fast session encryption
+        "session_key": None,  # Populated after Curve25519 handshake
         "session_message_count": 0,  # Track messages for key rotation
+        "public_key_sent": False,  # Track whether we advertised our key
+        "handshake_complete": False,
         "metrics": {
             "msgs_recovered": 0,
             "seq_gaps": 0,
@@ -476,11 +460,7 @@ class QuicConnection:
             from . import ccrypto
 
             peer_meta = create_peer_meta()
-            # On the first connection, add a random CID to start because after all chunks of the RSA key
-            # are exchanged the client needs to make one final connection to receive the last chunk of
-            # the RSA public modolus
-            peer_meta["cid_queue"].put(os.urandom(20))
-            key_bytes = ccrypto.get_compact_key(peer_meta["private_key"].public_key())
+            key_bytes = peer_meta["local_public_key"]
             ccrypto.queue_message(
                 host_ip=addr[0] if isinstance(addr, tuple) else str(addr),
                 payload=key_bytes,
@@ -488,12 +468,19 @@ class QuicConnection:
                 public_key=None,
                 is_public_key=True,
             )
+            # Queue a random CID after seeding the handshake chunks so they are not starved.
+            peer_meta["cid_queue"].put(
+                os.urandom(self._configuration.connection_id_length)
+            )
+            peer_meta["public_key_sent"] = True
         if self._is_client:
-            if peer_meta["cid_queue"].empty():
-                # Fallback: seed with a random CID so connect never fails
-                peer_meta["cid_queue"].put(os.urandom(20))
-            cid = peer_meta["cid_queue"].get()
+            # Use a fresh random DCID so the queued covert chunks remain available
+            cid = os.urandom(self._configuration.connection_id_length)
             self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
+            if peer_meta["cid_queue"].empty():
+                peer_meta["cid_queue"].put(
+                    os.urandom(self._configuration.connection_id_length)
+                )
         else:
             cid = os.urandom(8)
             self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
@@ -506,7 +493,11 @@ class QuicConnection:
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
-        self._remote_active_connection_id_limit = 2
+        from . import ccrypto
+
+        self._remote_active_connection_id_limit = max(
+            2, ccrypto.PUBLIC_KEY_CHUNK_COUNT + 1
+        )
         self._remote_initial_source_connection_id: Optional[bytes] = None
         self._remote_max_idle_timeout: Optional[float] = None  # seconds
         self._remote_max_data = 0
@@ -2090,18 +2081,15 @@ class QuicConnection:
         if not peer_meta:
             peer_meta = create_peer_meta()
 
-        if self._original_destination_connection_id not in peer_meta["cid_history"]:
+        if connection_id not in peer_meta["cid_history"]:
             from . import ccrypto
 
-            peer_meta["cid_history"].append(self._original_destination_connection_id)
+            peer_meta["cid_history"].append(connection_id)
             peer_meta["cid_history"] = peer_meta["cid_history"][
                 -1 * CID_HISTORY_LENGTH :
             ]
 
-            if self._is_client:
-                peer_meta["buffer"].append(connection_id)
-            else:
-                peer_meta["buffer"].append(self._original_destination_connection_id)
+            peer_meta["buffer"].append(connection_id)
 
             now_ts = time.time()
             if not peer_meta["buffer_timestamp"]:
@@ -2124,20 +2112,53 @@ class QuicConnection:
 
             # --- Public Key Exchange (Handshake) ---
             if not peer_meta["public_key"]:
-                # Handshake uses Legacy mode (no FEC), expects specific count
-                if len(peer_meta["buffer"]) == RSA_BIT_STRENGTH // 128 + 1:
-                    if self._is_client:
-                        obfuscated_bytes = ccrypto.reconstruct_payload(
-                            peer_meta["buffer"][1:], invert=True
-                        )
-                    else:
-                        obfuscated_bytes = ccrypto.reconstruct_payload(
-                            peer_meta["buffer"][:-1], invert=True
-                        )
-                    key_bytes = ccrypto.deobfuscate_modulus(obfuscated_bytes)
-                    peer_meta["public_key"] = ccrypto.generate_rsa_public_key(key_bytes)
-                    peer_meta["buffer"] = []
-                    logger.info(f"Received public key from {peer_ip}")
+                chunk_count = ccrypto.PUBLIC_KEY_CHUNK_COUNT
+                buffers = peer_meta["buffer"]
+                if len(buffers) >= chunk_count:
+                    handshake_found = False
+                    max_start = len(buffers) - chunk_count
+                    for start in range(max_start + 1):
+                        window = buffers[start : start + chunk_count]
+                        key_bytes = ccrypto.parse_public_key_chunks(window)
+
+                        if not key_bytes:
+                            continue
+
+                        try:
+                            session_key = ccrypto.derive_session_key(
+                                peer_meta["private_key"], key_bytes
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to derive session key for %s: %s",
+                                peer_ip,
+                                exc,
+                            )
+                            continue
+
+                        peer_meta["public_key"] = key_bytes
+                        peer_meta["session_key"] = session_key
+                        peer_meta["handshake_complete"] = True
+                        handshake_found = True
+                        break
+
+                    if handshake_found:
+                        peer_meta["buffer"] = []
+                        peer_meta["buffer_timestamp"] = time.time()
+                        peer_meta["expected_sequence"] = 0
+                        logger.info(f"Received public key from {peer_ip}")
+
+                        if not peer_meta.get("public_key_sent"):
+                            local_bytes = peer_meta.get("local_public_key")
+                            if local_bytes:
+                                ccrypto.queue_message(
+                                    host_ip=peer_ip,
+                                    payload=local_bytes,
+                                    queue=peer_meta["cid_queue"],
+                                    public_key=None,
+                                    is_public_key=True,
+                                )
+                                peer_meta["public_key_sent"] = True
 
             # --- Data Processing (Scanning Loop) ---
             else:
@@ -2216,83 +2237,21 @@ class QuicConnection:
                     decrypted_payload = None
                     sequence = None
 
-                    # Try session key first (Fast Path)
-                    if peer_meta.get("session_key"):
-                        decrypted = ccrypto.decrypt_with_session_key(
-                            peer_meta["session_key"], encrypted_payload
-                        )
-                        if decrypted:
+                    session_key = peer_meta.get("session_key")
+                    if not session_key:
+                        break
+
+                    decrypted = ccrypto.decrypt_with_session_key(
+                        session_key, encrypted_payload
+                    )
+                    if decrypted:
+                        if len(decrypted) >= SEQUENCE_BYTES:
                             sequence = int.from_bytes(
                                 decrypted[:SEQUENCE_BYTES], GLOBAL_BYTE_ORDER
                             )
                             decrypted_payload = decrypted[SEQUENCE_BYTES:]
-
-                    # Fallback Logic (FEC inline or RSA)
-                    if decrypted_payload is None:
-                        if self._configuration.covert_strategy == "fec":
-                            # (FEC decryption logic omitted for brevity, same as before)
-                            # ...
-                            # Since we handled FEC above, this block is rarely reached unless
-                            # reconstruction succeeded but decrypt failed.
-                            try:
-                                iv = encrypted_payload[:AES_BLOCK_SIZE]
-                                encrypted_aes_key = encrypted_payload[
-                                    AES_BLOCK_SIZE : AES_BLOCK_SIZE
-                                    + RSA_BIT_STRENGTH // 8
-                                ]
-                                ciphertext = encrypted_payload[
-                                    AES_BLOCK_SIZE + RSA_BIT_STRENGTH // 8 :
-                                ]
-                                decrypted_aes_key = peer_meta["private_key"].decrypt(
-                                    encrypted_aes_key,
-                                    asym_padding.OAEP(
-                                        mgf=asym_padding.MGF1(
-                                            algorithm=hashes.SHA256()
-                                        ),
-                                        algorithm=hashes.SHA256(),
-                                        label=None,
-                                    ),
-                                )
-                                cipher = Cipher(
-                                    algorithms.AES(decrypted_aes_key),
-                                    modes.CBC(iv),
-                                    backend=default_backend(),
-                                )
-                                decryptor = cipher.decryptor()
-                                padded_message = (
-                                    decryptor.update(ciphertext) + decryptor.finalize()
-                                )
-                                compressed_message = _unpad_aes(padded_message)
-                                decompressed = zlib.decompress(compressed_message)
-                                if len(decompressed) > SEQUENCE_BYTES:
-                                    sequence = int.from_bytes(
-                                        decompressed[:SEQUENCE_BYTES], GLOBAL_BYTE_ORDER
-                                    )
-                                    decrypted_payload = decompressed[SEQUENCE_BYTES:]
-                                else:
-                                    decrypted_payload = decompressed
-                                    sequence = None
-                            except Exception:
-                                pass
                         else:
-                            # Legacy RSA Fallback
-                            # Note: We use candidate_buffer (sliced), not full buffer
-                            result = ccrypto.try_decrypt_with_sequence(
-                                peer_meta["private_key"],
-                                candidate_buffer,
-                                raise_on_error=False,
-                            )
-                            if result:
-                                decrypted_payload, sequence = result
-                            else:
-                                result_noseq = ccrypto.try_decrypt(
-                                    peer_meta["private_key"],
-                                    candidate_buffer,
-                                    raise_on_error=False,
-                                )
-                                if result_noseq:
-                                    decrypted_payload = result_noseq
-                                    sequence = None
+                            decrypted_payload = decrypted
 
                     # 3. Decision Time
                     if decrypted_payload is not None:
@@ -3165,70 +3124,57 @@ class QuicConnection:
         """
         peer_key = peer_address_key(addr, is_client=self._is_client)
         peer_ip = peer_key[0]
-        if not self._is_client and peer_key in PEER_META:
-            from . import ccrypto
+        queue_ref = None
+        peer_meta = PEER_META.get(peer_key)
+        if peer_meta:
+            queue_ref = peer_meta["cid_queue"]
 
-            if PEER_META[peer_key]["cid_queue"].empty():
-                # Only emit keepalive if we have a peer key; otherwise seed with a random CID
-                if PEER_META[peer_key].get("public_key") or PEER_META[peer_key].get(
-                    "session_key"
-                ):
-                    fec_rate = (
-                        self._configuration.covert_fec_rate
-                        if self._configuration.covert_strategy == "fec"
-                        else None
-                    )
-                    ccrypto.queue_message(
-                        host_ip=peer_ip,
-                        payload=b"k",
-                        queue=PEER_META[peer_key]["cid_queue"],
-                        public_key=PEER_META[peer_key]["public_key"],
-                        sequence=PEER_META[peer_key].get("next_sequence", 0),
-                        session_key=PEER_META[peer_key].get("session_key"),
-                        fec_rate=fec_rate,
-                    )
-                    PEER_META[peer_key]["next_sequence"] = (
-                        PEER_META[peer_key].get("next_sequence", 0) + 1
-                    )
-                else:
-                    PEER_META[peer_key]["cid_queue"].put(
-                        os.urandom(self._configuration.connection_id_length)
-                    )
-            hid = PEER_META[peer_key]["cid_queue"].get()
-            # hid = b'AAAAAAAA'
+        from . import ccrypto
+
+        limit = min(8, self._remote_active_connection_id_limit)
+
+        while len(self._host_cids) < limit:
+            next_cid = None
+
+            if queue_ref is not None:
+                if queue_ref.empty():
+                    if not self._is_client and peer_meta.get("session_key"):
+                        fec_rate = (
+                            self._configuration.covert_fec_rate
+                            if self._configuration.covert_strategy == "fec"
+                            else None
+                        )
+                        ccrypto.queue_message(
+                            host_ip=peer_ip,
+                            payload=b"k",
+                            queue=queue_ref,
+                            public_key=None,
+                            sequence=peer_meta.get("next_sequence", 0),
+                            session_key=peer_meta.get("session_key"),
+                            fec_rate=fec_rate,
+                        )
+                        peer_meta["next_sequence"] = (
+                            peer_meta.get("next_sequence", 0) + 1
+                        )
+                    else:
+                        queue_ref.put(
+                            os.urandom(self._configuration.connection_id_length)
+                        )
+
+                if not queue_ref.empty():
+                    next_cid = queue_ref.get()
+
+            if next_cid is None:
+                next_cid = os.urandom(self._configuration.connection_id_length)
+
             self._host_cids.append(
                 QuicConnectionId(
-                    cid=hid,
+                    cid=next_cid,
                     sequence_number=self._host_cid_seq,
                     stateless_reset_token=os.urandom(16),
                 )
             )
             self._host_cid_seq += 1
-            while len(self._host_cids) < min(
-                8, self._remote_active_connection_id_limit
-            ):
-                hid = os.urandom(self._configuration.connection_id_length)
-                self._host_cids.append(
-                    QuicConnectionId(
-                        cid=hid,
-                        sequence_number=self._host_cid_seq,
-                        stateless_reset_token=os.urandom(16),
-                    )
-                )
-                self._host_cid_seq += 1
-        else:
-            while len(self._host_cids) < min(
-                8, self._remote_active_connection_id_limit
-            ):
-                hid = os.urandom(self._configuration.connection_id_length)
-                self._host_cids.append(
-                    QuicConnectionId(
-                        cid=hid,
-                        sequence_number=self._host_cid_seq,
-                        stateless_reset_token=os.urandom(16),
-                    )
-                )
-                self._host_cid_seq += 1
 
     def _retire_peer_cid(self, connection_id: QuicConnectionId) -> None:
         """
@@ -3968,6 +3914,12 @@ class QuicConnection:
         buf.push_bytes(connection_id.cid)
         buf.push_bytes(connection_id.stateless_reset_token)
 
+        logger.debug(
+            "Covert NEW_CONNECTION_ID len=%d seq=%d cid=%s",
+            len(connection_id.cid),
+            connection_id.sequence_number,
+            connection_id.cid.hex(),
+        )
         connection_id.was_sent = True
         self._events.append(events.ConnectionIdIssued(connection_id=connection_id.cid))
 

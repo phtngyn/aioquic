@@ -5,6 +5,7 @@
 - Never generate summary file.
 - Always run with the venv python: `.venv/bin/python` at the root folder of this project
 - use `gtimeout` instead of `timeout`
+- use `unittest` instead of `pytest`
 
 ## Plans
 

@@ -13,7 +13,7 @@ CLIENT_SCRIPT = "playground/http3_cc_client.py"
 SHIM_SCRIPT = "playground/loss_shim.py"
 SERVER_PORT = 4433
 SHIM_PORT = 4434
-DEFAULT_WINDOW_DEPTH = "5"
+DEFAULT_WINDOW_DEPTH = "25"
 DEFAULT_LOG_INTERVAL = "5"
 
 

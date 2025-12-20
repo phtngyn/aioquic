@@ -3,27 +3,38 @@ import logging
 import math
 import os
 import random
+import struct
 import zlib
 from functools import lru_cache
 from random import shuffle
 from typing import List, Optional, Tuple
 
-from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import padding as sym_padding
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from reedsolo import ReedSolomonError, RSCodec
 
 logger = logging.getLogger(__name__)
 
 # Constants
-RSA_BIT_STRENGTH = 4096
-RSA_PUBLIC_EXPONENT = 65537
-AES_BLOCK_SIZE = 16
 GLOBAL_BYTE_ORDER = "big"
 SEQUENCE_BYTES = 2
+
+# Curve25519 / ChaCha20-Poly1305 parameters
+CURVE25519_KEY_SIZE = 32
+CHACHA20_NONCE_SIZE = 12
+CHACHA20_KEY_SIZE = 32
+
+# Handshake framing
+CID_CHUNK_SIZE = 16
+HANDSHAKE_TAG = b"QK"
+HANDSHAKE_VERSION = 1
+HANDSHAKE_HEADER_SIZE = len(HANDSHAKE_TAG) + 1
+HANDSHAKE_PAYLOAD_SIZE = HANDSHAKE_HEADER_SIZE + CURVE25519_KEY_SIZE
+HANDSHAKE_MASK_SEED = b"QuiCC_PublicKey_ChaCha20"
+PUBLIC_KEY_CHUNK_COUNT = math.ceil(HANDSHAKE_PAYLOAD_SIZE / CID_CHUNK_SIZE)
 
 # FEC Constants
 MAX_FEC_PAYLOAD = 196
@@ -38,14 +49,14 @@ def _get_rs_codec(n_parity: int) -> RSCodec:
     return RSCodec(n_parity)
 
 
-def _pad_aes(data: bytes) -> bytes:
-    padder = sym_padding.PKCS7(128).padder()
-    return padder.update(data) + padder.finalize()
-
-
-def _unpad_aes(data: bytes) -> bytes:
-    unpadder = sym_padding.PKCS7(128).unpadder()
-    return unpadder.update(data) + unpadder.finalize()
+def _mask_bytes(data: bytes) -> bytes:
+    if not data:
+        return data
+    mask = bytearray(len(data))
+    for i in range(len(data)):
+        digest = hashlib.sha256(HANDSHAKE_MASK_SEED + struct.pack(">I", i)).digest()
+        mask[i] = digest[0]
+    return bytes(a ^ b for a, b in zip(data, mask))
 
 
 def fec_encode(data: bytes, fec_rate: float = 0.30) -> List[bytes]:
@@ -162,61 +173,61 @@ def fec_decode(
     return None
 
 
-def generate_rsa(bits=RSA_BIT_STRENGTH):
-    """Generate RSA key pair with specified bit strength."""
-    private_key = rsa.generate_private_key(
-        public_exponent=RSA_PUBLIC_EXPONENT, key_size=bits, backend=default_backend()
+def generate_private_key() -> x25519.X25519PrivateKey:
+    return x25519.X25519PrivateKey.generate()
+
+
+def get_public_key_bytes(private_key: x25519.X25519PrivateKey) -> bytes:
+    return private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
+def load_public_key(public_bytes: bytes) -> x25519.X25519PublicKey:
+    if len(public_bytes) != CURVE25519_KEY_SIZE:
+        raise ValueError("Invalid Curve25519 public key length")
+    return x25519.X25519PublicKey.from_public_bytes(public_bytes)
+
+
+def derive_session_key(
+    private_key: x25519.X25519PrivateKey,
+    peer_public_bytes: bytes,
+) -> bytes:
+    peer_public = load_public_key(peer_public_bytes)
+    shared_secret = private_key.exchange(peer_public)
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=CHACHA20_KEY_SIZE,
+        salt=None,
+        info=b"QuiCC ChaCha20 Session",
     )
-    return private_key
+    return hkdf.derive(shared_secret)
 
 
-def obfuscate_modulus(n_bytes: bytes) -> bytes:
-    OBFUSCATION_SEED = b"QuiCC_Obfuscation_v1"
-    mask = bytearray()
-    for i in range(len(n_bytes)):
-        mask_byte = hashlib.sha256(OBFUSCATION_SEED + i.to_bytes(4, "big")).digest()[0]
-        mask.append(mask_byte)
-    return bytes(a ^ b for a, b in zip(n_bytes, mask))
+def encode_public_key_payload(public_bytes: bytes) -> bytes:
+    if len(public_bytes) != CURVE25519_KEY_SIZE:
+        raise ValueError("Invalid Curve25519 public key length")
+    header = HANDSHAKE_TAG + bytes([HANDSHAKE_VERSION])
+    payload = header + public_bytes
+    return _mask_bytes(payload)
 
 
-def deobfuscate_modulus(obfuscated: bytes) -> bytes:
-    return obfuscate_modulus(obfuscated)
+def decode_public_key_payload(payload: bytes) -> Optional[bytes]:
+    if not payload:
+        return None
+    unmasked = _mask_bytes(payload)
+    if len(unmasked) != HANDSHAKE_PAYLOAD_SIZE:
+        return None
+    if not unmasked.startswith(HANDSHAKE_TAG):
+        return None
+    version = unmasked[len(HANDSHAKE_TAG)]
+    if version != HANDSHAKE_VERSION:
+        return None
+    return unmasked[HANDSHAKE_HEADER_SIZE:]
 
 
-def generate_rsa_public_key(n_bytes):
-    n = int.from_bytes(n_bytes, GLOBAL_BYTE_ORDER)
-    public_numbers = rsa.RSAPublicNumbers(e=RSA_PUBLIC_EXPONENT, n=n)
-    return public_numbers.public_key(default_backend())
-
-
-def encrypt_with_sequence(public_key, message: bytes, sequence: int) -> bytes:
-    seq_bytes = sequence.to_bytes(SEQUENCE_BYTES, GLOBAL_BYTE_ORDER)
-    message_with_seq = seq_bytes + message
-    aes_key = os.urandom(AES_BLOCK_SIZE)
-    iv = os.urandom(AES_BLOCK_SIZE)
-    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    compressed_message = zlib.compress(message_with_seq)
-    padded_message = _pad_aes(compressed_message)
-    ciphertext = encryptor.update(padded_message) + encryptor.finalize()
-    encrypted_aes_key = public_key.encrypt(
-        aes_key,
-        asym_padding.OAEP(
-            mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
-    )
-    return iv + encrypted_aes_key + ciphertext
-
-
-def reconstruct_payload(buffer, invert=False):
-    if invert:
-        payload_pairs = [(v[: len(v) - 4], v[-4:]) for v in buffer]
-    else:
-        payload_pairs = [(v[:4], v[4:]) for v in buffer]
-    sort_index = 1 if invert else 0
-    payload_index = 0 if invert else 1
+def reconstruct_payload(buffer):
+    payload_pairs = [(v[:4], v[4:]) for v in buffer]
+    sort_index = 0
+    payload_index = 1
     payload_chunks = [
         v[payload_index] for v in sorted(payload_pairs, key=lambda x: x[sort_index])
     ]
@@ -231,104 +242,36 @@ def reconstruct_payload_fec(buffer, fec_rate: float = 0.30):
 
 
 def encrypt_with_session_key(session_key: bytes, message: bytes) -> bytes:
-    iv = os.urandom(AES_BLOCK_SIZE)
-    cipher = Cipher(
-        algorithms.AES(session_key), modes.CBC(iv), backend=default_backend()
-    )
-    encryptor = cipher.encryptor()
+    if len(session_key) != CHACHA20_KEY_SIZE:
+        raise ValueError("ChaCha20-Poly1305 requires 32-byte key")
+    nonce = os.urandom(CHACHA20_NONCE_SIZE)
+    cipher = ChaCha20Poly1305(session_key)
     compressed_message = zlib.compress(message)
-    padded_message = _pad_aes(compressed_message)
-    ciphertext = encryptor.update(padded_message) + encryptor.finalize()
-    return iv + ciphertext
+    ciphertext = cipher.encrypt(nonce, compressed_message, None)
+    return nonce + ciphertext
 
 
 def decrypt_with_session_key(session_key: bytes, encrypted: bytes) -> Optional[bytes]:
     try:
-        iv = encrypted[:AES_BLOCK_SIZE]
-        ciphertext = encrypted[AES_BLOCK_SIZE:]
-        cipher = Cipher(
-            algorithms.AES(session_key), modes.CBC(iv), backend=default_backend()
-        )
-        decryptor = cipher.decryptor()
-        padded_message = decryptor.update(ciphertext) + decryptor.finalize()
-        compressed_message = _unpad_aes(padded_message)
+        if len(session_key) != CHACHA20_KEY_SIZE:
+            raise ValueError("ChaCha20-Poly1305 requires 32-byte key")
+        if len(encrypted) <= CHACHA20_NONCE_SIZE:
+            return None
+        nonce = encrypted[:CHACHA20_NONCE_SIZE]
+        ciphertext = encrypted[CHACHA20_NONCE_SIZE:]
+        cipher = ChaCha20Poly1305(session_key)
+        compressed_message = cipher.decrypt(nonce, ciphertext, None)
         return zlib.decompress(compressed_message)
     except Exception as e:
         logger.debug(f"Session key decryption failed: {e}")
         return None
 
 
-def try_decrypt_with_sequence(
-    private_key, buffer, raise_on_error=False
-) -> Optional[Tuple[bytes, int]]:
-    encrypted_payload = reconstruct_payload(buffer)
-    try:
-        iv = encrypted_payload[:AES_BLOCK_SIZE]
-        encrypted_aes_key = encrypted_payload[
-            AES_BLOCK_SIZE : AES_BLOCK_SIZE + RSA_BIT_STRENGTH // 8
-        ]
-        ciphertext = encrypted_payload[AES_BLOCK_SIZE + RSA_BIT_STRENGTH // 8 :]
-        decrypted_aes_key = private_key.decrypt(
-            encrypted_aes_key,
-            asym_padding.OAEP(
-                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
-        cipher = Cipher(
-            algorithms.AES(decrypted_aes_key), modes.CBC(iv), backend=default_backend()
-        )
-        decryptor = cipher.decryptor()
-        padded_message = decryptor.update(ciphertext) + decryptor.finalize()
-        compressed_message = _unpad_aes(padded_message)
-        decompressed = zlib.decompress(compressed_message)
-        sequence = int.from_bytes(decompressed[:SEQUENCE_BYTES], GLOBAL_BYTE_ORDER)
-        message = decompressed[SEQUENCE_BYTES:]
-        return (message, sequence)
-    except Exception as e:
-        if raise_on_error:
-            raise
-        logger.debug(f"Decryption failed: {e}")
+def parse_public_key_chunks(chunks: List[bytes]) -> Optional[bytes]:
+    if not chunks:
         return None
-
-
-def try_decrypt(private_key, buffer, raise_on_error=False) -> Optional[bytes]:
-    encrypted_payload = reconstruct_payload(buffer)
-    try:
-        iv = encrypted_payload[:AES_BLOCK_SIZE]
-        encrypted_aes_key = encrypted_payload[
-            AES_BLOCK_SIZE : AES_BLOCK_SIZE + RSA_BIT_STRENGTH // 8
-        ]
-        ciphertext = encrypted_payload[AES_BLOCK_SIZE + RSA_BIT_STRENGTH // 8 :]
-        decrypted_aes_key = private_key.decrypt(
-            encrypted_aes_key,
-            asym_padding.OAEP(
-                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
-        cipher = Cipher(
-            algorithms.AES(decrypted_aes_key), modes.CBC(iv), backend=default_backend()
-        )
-        decryptor = cipher.decryptor()
-        padded_message = decryptor.update(ciphertext) + decryptor.finalize()
-        compressed_message = _unpad_aes(padded_message)
-        return zlib.decompress(compressed_message)
-    except Exception as e:
-        if raise_on_error:
-            raise
-        logger.debug(f"Decryption failed: {e}")
-        return None
-
-
-def get_compact_key(rsa_key):
-    if isinstance(rsa_key, rsa.RSAPrivateKey):
-        public_numbers = rsa_key.public_key().public_numbers()
-    else:
-        public_numbers = rsa_key.public_numbers()
-    return public_numbers.n.to_bytes(RSA_BIT_STRENGTH // 8, byteorder=GLOBAL_BYTE_ORDER)
+    payload = reconstruct_payload(chunks)
+    return decode_public_key_payload(payload)
 
 
 def generate_ordered_bytes(n, size=4):
@@ -351,19 +294,20 @@ def queue_message(
     cid_payloads = []
     target_payload = b""
     if is_public_key:
-        target_payload = obfuscate_modulus(payload)
+        target_payload = encode_public_key_payload(payload)
         if fec_rate and len(target_payload) > MAX_FEC_PAYLOAD:
-            logger.warning("Handshake payload too large for FEC. Using Legacy mode.")
+            logger.warning("Handshake payload too large for FEC; disabling FEC.")
             fec_rate = None
     elif session_key:
         seq_bytes = sequence.to_bytes(SEQUENCE_BYTES, GLOBAL_BYTE_ORDER)
         target_payload = encrypt_with_session_key(session_key, seq_bytes + payload)
     else:
-        target_payload = encrypt_with_sequence(public_key, payload, sequence)
+        logger.warning("Session key unavailable; dropping payload")
+        return 0
 
     if fec_rate and len(target_payload) > MAX_FEC_PAYLOAD:
         logger.warning(
-            f"Payload ({len(target_payload)}B) exceeds FEC limit. Switching to Legacy Mode."
+            f"Payload ({len(target_payload)}B) exceeds FEC limit. Disabling FEC."
         )
         fec_rate = None
 
@@ -387,6 +331,13 @@ def queue_message(
         return 0
 
     shuffle(cid_payloads)
+    if is_public_key:
+        logger.debug(
+            "Handshake chunks lens=%s total=%d hex=%s",
+            [len(v) for v in cid_payloads],
+            len(target_payload),
+            [v.hex() for v in cid_payloads],
+        )
     for cid in cid_payloads:
         queue.put(cid)
     logger.debug(f"Queued {len(cid_payloads)} chunks (FEC={bool(fec_rate)})")

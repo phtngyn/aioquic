@@ -7,7 +7,11 @@ import threading
 import time
 from urllib.parse import urlparse
 
-from aioquic.quic.ccrypto import SEQUENCE_BYTES, get_compact_key, queue_message
+from aioquic.quic.ccrypto import (
+    SEQUENCE_BYTES,
+    get_public_key_bytes,
+    queue_message,
+)
 from aioquic.quic.connection import (
     PEER_META,
     PEER_META_LOCK,
@@ -59,7 +63,9 @@ class QuiCCli:
             peer_meta = create_peer_meta()
 
             # Queue the public key handshake immediately
-            key_bytes = get_compact_key(peer_meta["private_key"])
+            key_bytes = peer_meta.get("local_public_key")
+            if key_bytes is None:
+                key_bytes = get_public_key_bytes(peer_meta["private_key"])
             queue_message(
                 host_ip=self.host_ip,
                 payload=key_bytes,
@@ -67,6 +73,7 @@ class QuiCCli:
                 public_key=None,
                 is_public_key=True,
             )
+            peer_meta["public_key_sent"] = True
             # Queue initial random CID for connection establishment
             peer_meta["cid_queue"].put(os.urandom(20))
 
@@ -193,6 +200,10 @@ class QuiCCli:
                 session_key=peer_meta.get("session_key"),
                 fec_rate=fec_rate,
             )
+
+            if count == 0 and peer_meta.get("session_key") is None:
+                print("Handshake not complete; unable to send yet.")
+                return True
 
             if self.shaper_mode != "none":
                 print("Message queued. Transmission will be shaped.")

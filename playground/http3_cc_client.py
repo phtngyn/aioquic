@@ -404,8 +404,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sliding-window-depth",
         type=int,
-        default=5,
-        help="max legacy buffer drops per recovery attempt (default: 5)",
+        default=25,
+        help="max legacy buffer drops per recovery attempt (default: 25)",
     )
     parser.add_argument(
         "--metrics-log-interval",
