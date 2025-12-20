@@ -26,8 +26,8 @@ class TrafficShaper:
     def __init__(self, mode="cloudflare"):
         self.mode = mode
         if mode == "cloudflare":
-            self.mu = -11.2251
-            self.sigma = 2.8571
+            self.mu = -11.5919
+            self.sigma = 2.8938
             self.min_interval = 0.000001
         elif mode == "none":
             self.min_interval = 0
