@@ -1,8 +1,6 @@
 import os
-import random
 import re
 import signal
-import string
 import subprocess
 import sys
 import time
@@ -14,6 +12,8 @@ CLIENT_SCRIPT = "playground/http3_cc_client.py"
 SHIM_SCRIPT = "playground/loss_shim.py"
 SERVER_PORT = 4433
 SHIM_PORT = 4434
+DEFAULT_WINDOW_DEPTH = "5"
+DEFAULT_LOG_INTERVAL = "5"
 
 
 class TestHarness:
@@ -21,7 +21,9 @@ class TestHarness:
         self.processes = []
         self.log_files = {}
 
-    def start_process(self, command, name, log_file=None, input_data=None):
+    def start_process(
+        self, command, name, log_file=None, input_data=None, keep_input_open=False
+    ):
         """Starts a background process and tracks it."""
         print(f"    [+] Starting {name}...")
 
@@ -50,7 +52,8 @@ class TestHarness:
             try:
                 p.stdin.write(input_data)
                 p.stdin.flush()
-                p.stdin.close()
+                if not keep_input_open:
+                    p.stdin.close()
             except OSError as e:
                 print(f"    [!] Failed to write input to {name}: {e}")
 
@@ -68,6 +71,11 @@ class TestHarness:
                     os.killpg(os.getpgid(p.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            if p.stdin and not p.stdin.closed:
+                try:
+                    p.stdin.close()
+                except Exception:
+                    pass
 
         for f in self.log_files.values():
             if not f.closed:
@@ -78,7 +86,13 @@ class TestHarness:
 
     def parse_server_metrics(self, log_path):
         """Reads the server log to extract final metrics."""
-        metrics = {"recovered": 0, "decrypt_failures": 0, "gaps": 0, "flushes": 0}
+        metrics = {
+            "recovered": 0,
+            "decrypt_failures": 0,
+            "gaps": 0,
+            "flushes": 0,
+            "drops": 0,
+        }
         if not os.path.exists(log_path):
             return metrics
 
@@ -95,6 +109,7 @@ class TestHarness:
                     recovered = re.search(r"recovered=(\d+)", line)
                     fails = re.search(r"decrypt_failures=(\d+)", line)
                     gaps = re.search(r"(?:seq_)?gaps=(\d+)", line)
+                    drops = re.search(r"(?:dropped_packets_est|lost_est)=(\d+)", line)
                     flushes = re.search(r"flushes=(\d+)", line)
 
                     if recovered:
@@ -111,6 +126,8 @@ class TestHarness:
                         metrics["flushes"] = max(
                             metrics["flushes"], int(flushes.group(1))
                         )
+                    if drops:
+                        metrics["drops"] = max(metrics["drops"], int(drops.group(1)))
 
         # Use the higher of the two counts
         metrics["recovered"] = max(metrics["recovered"], manual_recovery_count)
@@ -124,6 +141,7 @@ class TestHarness:
         client_args,
         shim_args=None,
         client_input=None,
+        client_input_keep_open=False,
         duration=15,
     ):
         print(f"\n=== RUNNING: {test_name} ===")
@@ -162,7 +180,13 @@ class TestHarness:
             # 3. Client
             url = f"https://localhost:{target_port}/"
             cli_cmd = [PYTHON_EXEC, CLIENT_SCRIPT, url] + client_args
-            self.start_process(cli_cmd, "Client", client_log, input_data=client_input)
+            self.start_process(
+                cli_cmd,
+                "Client",
+                client_log,
+                input_data=client_input,
+                keep_input_open=client_input_keep_open,
+            )
 
             # 4. Wait
             print(f"    [*] Running for {duration} seconds...")
@@ -174,7 +198,7 @@ class TestHarness:
         # 5. Report
         metrics = self.parse_server_metrics(server_log)
         print(
-            f"    [-] Results: Recov={metrics['recovered']} | Fail={metrics['decrypt_failures']} | Gaps={metrics['gaps']}"
+            f"    [-] Results: Recov={metrics['recovered']} | Fail={metrics['decrypt_failures']} | Gaps={metrics['gaps']} | Drops={metrics['drops']}"
         )
 
         # --- DEBUG: IF FAILED, SHOW LOGS (Ignore Stealth tests) ---
@@ -202,38 +226,88 @@ class TestHarness:
         print("        ------------------------")
 
 
-# --- PAYLOAD GENERATOR ---
-def generate_payload(size):
-    return "".join(random.choices(string.ascii_letters + string.digits, k=size))
-
-
 # --- MAIN EXECUTION ---
 def main():
     harness = TestHarness()
     results = {}
 
     print("[*] Generating payloads (Resized for burst limits)...")
-    payload_med = generate_payload(100)  # ~6 packets
-    payload_large = generate_payload(400)  # ~25 packets
-    payload_heavy = generate_payload(800)  # ~50 packets (Max limit)
+    base_messages = [
+        "Meet at dawn by the old pier.",
+        "Supplies arrived safely at warehouse three.",
+        "Signal again if the plan changes before nightfall.",
+    ]
+    batch_messages = base_messages + [
+        "Extraction delayed until further notice.",
+        "Hold position until you receive the green flare.",
+    ]
+
+    payload_small = base_messages[0]
+    payload_fec = base_messages[1]
+    payload_heavy = " ".join(batch_messages)  # still well under burst + FEC limits
 
     # Input for interactive tests
-    input_mixed = f"m:{payload_med}\nm:{payload_large}\nq\n"
+    input_mixed = "".join(f"m:{msg}\n" for msg in base_messages) + "q\n"
+    input_batch = "".join(f"m:{msg}\n" for msg in batch_messages) + "q\n"
+    input_stealth = "".join(f"m:{msg}\n" for msg in base_messages)
 
     # =======================================================
     # SUITE 1: TRAFFIC SHAPING (Stealth Stability)
     # =======================================================
-    results["01_Stealth_Cloudflare"] = harness.run_test(
-        "01_Stealth_Cloudflare",
-        server_args=["--covert-strategy", "legacy"],
+    results["01_Stealth_Cloudflare_NoLoss"] = harness.run_test(
+        "01_Stealth_Cloudflare_NoLoss",
+        server_args=[
+            "--covert-strategy",
+            "legacy",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
         shim_args=None,
         client_args=[
             "--covert-strategy",
             "legacy",
             "--traffic-shaper-mode",
             "cloudflare",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
         ],
-        duration=15,
+        client_input=input_stealth,
+        client_input_keep_open=True,
+        duration=20,
+    )
+
+    results["02_Stealth_Cloudflare_Drops"] = harness.run_test(
+        "02_Stealth_Cloudflare_Drops",
+        server_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        shim_args=["--drop-in", "0.15", "--drop-out", "0.05"],
+        client_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--traffic-shaper-mode",
+            "cloudflare",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        client_input=input_stealth,
+        client_input_keep_open=True,
+        duration=22,
     )
 
     # =======================================================
@@ -241,22 +315,129 @@ def main():
     # =======================================================
     loss_severe = "0.25"
 
-    results["02_FEC_0.2_vs_25Loss"] = harness.run_test(
-        "02_FEC_0.2_vs_25Loss",
-        server_args=["--covert-strategy", "fec", "--fec-rate", "0.2"],
+    results["03_FEC_0.2_vs_25Loss"] = harness.run_test(
+        "03_FEC_0.2_vs_25Loss",
+        server_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.2",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
         shim_args=["--drop-in", loss_severe],
-        client_args=["--covert-strategy", "fec", "--fec-rate", "0.2"],
+        client_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.2",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
         client_input=input_mixed,
         duration=15,
     )
 
-    results["03_FEC_0.5_vs_25Loss"] = harness.run_test(
-        "03_FEC_0.5_vs_25Loss",
-        server_args=["--covert-strategy", "fec", "--fec-rate", "0.5"],
+    results["04_FEC_0.5_vs_25Loss"] = harness.run_test(
+        "04_FEC_0.5_vs_25Loss",
+        server_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
         shim_args=["--drop-in", loss_severe],
-        client_args=["--covert-strategy", "fec", "--fec-rate", "0.5"],
+        client_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
         client_input=input_mixed,
         duration=15,
+    )
+
+    # =======================================================
+    # SUITE 2B: HARSH LOSS + BATCH DELIVERY
+    # =======================================================
+    harsh_drop_in = "0.35"
+    harsh_drop_out = "0.15"
+    harsh_grace = "5.0"
+
+    results["04_Legacy_vs_35Loss_Bidir"] = harness.run_test(
+        "04_Legacy_vs_35Loss_Bidir",
+        server_args=[
+            "--covert-strategy",
+            "legacy",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        shim_args=[
+            "--drop-in",
+            harsh_drop_in,
+            "--drop-out",
+            harsh_drop_out,
+            "--grace-period",
+            harsh_grace,
+        ],
+        client_args=[
+            "--covert-strategy",
+            "legacy",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        client_input=input_batch,
+        duration=20,
+    )
+
+    results["05_FEC_0.5_vs_35Loss_Bidir"] = harness.run_test(
+        "05_FEC_0.5_vs_35Loss_Bidir",
+        server_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        shim_args=[
+            "--drop-in",
+            harsh_drop_in,
+            "--drop-out",
+            harsh_drop_out,
+            "--grace-period",
+            harsh_grace,
+        ],
+        client_args=[
+            "--covert-strategy",
+            "fec",
+            "--fec-rate",
+            "0.5",
+            "--sliding-window-depth",
+            DEFAULT_WINDOW_DEPTH,
+            "--metrics-log-interval",
+            DEFAULT_LOG_INTERVAL,
+        ],
+        client_input=input_batch,
+        duration=20,
     )
 
     # =======================================================
@@ -273,8 +454,24 @@ def main():
         # Legacy Test
         res_leg = harness.run_test(
             f"Sweep_Legacy_{loss}",
-            server_args=["--covert-strategy", "legacy", "--sliding-window-depth", "5"],
-            client_args=["--covert-strategy", "legacy", "--message", payload_large],
+            server_args=[
+                "--covert-strategy",
+                "legacy",
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
+            ],
+            client_args=[
+                "--covert-strategy",
+                "legacy",
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
+                "--message",
+                payload_small,
+            ],
             shim_args=["--drop-in", loss],
             duration=12,
         )
@@ -282,19 +479,40 @@ def main():
         # FEC 0.3 Test
         res_fec = harness.run_test(
             f"Sweep_FEC_{loss}",
-            server_args=["--covert-strategy", "fec", "--fec-rate", "0.3"],
+            server_args=[
+                "--covert-strategy",
+                "fec",
+                "--fec-rate",
+                "0.3",
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
+            ],
             client_args=[
                 "--covert-strategy",
                 "fec",
                 "--fec-rate",
                 "0.3",
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
                 "--message",
-                payload_large,
+                payload_fec,
             ],
             shim_args=["--drop-in", loss],
             duration=12,
         )
-        sweep_data.append((loss, res_leg["recovered"], res_fec["recovered"]))
+        sweep_data.append(
+            (
+                loss,
+                res_leg["recovered"],
+                res_leg["drops"],
+                res_fec["recovered"],
+                res_fec["drops"],
+            )
+        )
 
     # =======================================================
     # SUITE 4: THROUGHPUT COST
@@ -337,10 +555,13 @@ def main():
 
     for name, m in results.items():
         outcome = "PASS"
-        if "FEC_0.2" in name and m["recovered"] < 2:
+        if "FEC_0.2" in name and m["recovered"] < len(base_messages):
             outcome = "EXPECTED FAIL (Too much loss)"
-        elif "FEC_0.5" in name and m["recovered"] == 2:
-            outcome = "PASS (Strong)"
+        elif "FEC_0.5" in name:
+            target = len(batch_messages) if "35Loss" in name else len(base_messages)
+            outcome = "PASS" if m["recovered"] >= target else "UNSTABLE"
+        elif "Cloudflare" in name:
+            outcome = "PASS" if m["recovered"] >= len(base_messages) else "UNSTABLE"
         elif "Stealth" in name:
             outcome = "STABLE"
         print(
@@ -349,9 +570,9 @@ def main():
 
     print("-" * 70)
     print("ROBUSTNESS SWEEP DATA:")
-    print("Loss% | Legacy Recov | FEC Recov")
+    print("Loss% | Leg Rec | Leg Drop | FEC Rec | FEC Drop")
     for row in sweep_data:
-        print(f"{row[0]:<5} | {row[1]:<12} | {row[2]:<9}")
+        print(f"{row[0]:<5} | {row[1]:<7} | {row[2]:<8} | {row[3]:<7} | {row[4]:<8}")
 
     print("-" * 70)
     print("THROUGHPUT OVERHEAD (FEC 0.5 vs Legacy):")
