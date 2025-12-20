@@ -50,6 +50,7 @@ class QuiCCli:
         self.shaper = TrafficShaper(mode=self.shaper_mode)
 
         self._stop_event = threading.Event()
+        self._handshake_queue = []
         self._traffic_thread = None
         self.peer_key = None
 
@@ -110,6 +111,7 @@ class QuiCCli:
 
     def _start_traffic_loop(self):
         # Prepare a raw socket for "Fast Chaff" injection
+        raw_sock = None
         try:
             addr_info = socket.getaddrinfo(
                 self.host_ip, self.host_port, type=socket.SOCK_DGRAM
@@ -117,8 +119,9 @@ class QuiCCli:
             family, socktype, proto, _, sockaddr = addr_info[0]
             raw_sock = socket.socket(family, socktype, proto)
         except Exception as e:
-            logger.error(f"Failed to create raw socket for shaper: {e}")
-            return
+            if self.shaper_mode != "none":
+                logger.error(f"Failed to create raw socket for shaper: {e}")
+                return
 
         def _loop():
             logger.info(f"Traffic shaper started (Mode: {self.shaper_mode})")
@@ -144,20 +147,48 @@ class QuiCCli:
 
                 peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
+                    time.sleep(0.1)
                     continue
+
+                # 0. Check for pending handshake messages (Flush Buffer)
+                if self._handshake_queue and peer_meta.get("session_key"):
+                    logger.info(
+                        "Handshake complete. Flushing %d queued messages.",
+                        len(self._handshake_queue),
+                    )
+                    while self._handshake_queue:
+                        cmd, fec_rate = self._handshake_queue.pop(0)
+                        queue_message(
+                            host_ip=self.host_ip,
+                            payload=cmd.encode("utf8"),
+                            queue=peer_meta["cid_queue"],
+                            public_key=peer_meta["public_key"],
+                            sequence=self._next_sequence(),
+                            session_key=peer_meta.get("session_key"),
+                            fec_rate=fec_rate,
+                        )
+                    # If not shaping, flush queue immediately
+                    if self.shaper_mode == "none":
+                        qsize = peer_meta["cid_queue"].qsize()
+                        if qsize > 0:
+                            self.send_message(qsize)
 
                 # 3. Fast Chaff vs Real Message
                 if peer_meta["cid_queue"].empty():
-                    try:
-                        packet = self.make_fake_quic_packet()
-                        raw_sock.sendto(packet, sockaddr)
-                    except OSError:
-                        pass
+                    if self.shaper_mode != "none" and raw_sock:
+                        try:
+                            packet = self.make_fake_quic_packet()
+                            raw_sock.sendto(packet, sockaddr)
+                        except OSError:
+                            pass
+                    else:
+                        time.sleep(0.05)  # Prevent busy loop in 'none' mode
                 else:
                     self.send_message(1)
 
             logger.info("Traffic shaper stopped")
-            raw_sock.close()
+            if raw_sock:
+                raw_sock.close()
 
         self._traffic_thread = threading.Thread(target=_loop, name="quic-shaper")
         self._traffic_thread.start()
@@ -190,6 +221,17 @@ class QuiCCli:
                 if self.configuration.covert_strategy == "fec"
                 else None
             )
+
+            # --- FIX: Buffer message if handshake isn't ready ---
+            if peer_meta.get("session_key") is None:
+                print("Handshake pending... buffering message.")
+                self._handshake_queue.append((cmd, fec_rate))
+                # Ensure the loop is running to flush this later
+                if self._traffic_thread is None or not self._traffic_thread.is_alive():
+                    self._start_traffic_loop()
+                return True
+            # ----------------------------------------------------
+
             # Just QUEUE the message.
             count = queue_message(
                 host_ip=self.host_ip,
@@ -200,10 +242,6 @@ class QuiCCli:
                 session_key=peer_meta.get("session_key"),
                 fec_rate=fec_rate,
             )
-
-            if count == 0 and peer_meta.get("session_key") is None:
-                print("Handshake not complete; unable to send yet.")
-                return True
 
             if self.shaper_mode != "none":
                 print("Message queued. Transmission will be shaped.")
