@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import signal
@@ -379,6 +380,52 @@ def main():
     )
 
     # =======================================================
+    # SUITE 2C: FEC RATE SWEEP (Loss 25%)
+    # =======================================================
+    fec_sweep_rates = [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+    fec_sweep_results = []
+
+    for rate in fec_sweep_rates:
+        rate_str = f"{rate:.2f}"
+        test_label = f"05_FEC_Sweep_{rate_str}"
+        metrics = harness.run_test(
+            test_label,
+            server_args=[
+                "--covert-strategy",
+                "fec",
+                "--fec-rate",
+                rate_str,
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
+            ],
+            shim_args=["--drop-in", loss_severe],
+            client_args=[
+                "--covert-strategy",
+                "fec",
+                "--fec-rate",
+                rate_str,
+                "--sliding-window-depth",
+                DEFAULT_WINDOW_DEPTH,
+                "--metrics-log-interval",
+                DEFAULT_LOG_INTERVAL,
+            ],
+            client_input=input_mixed,
+            duration=15,
+            expected_messages=expected_count,
+        )
+
+        results[test_label] = metrics
+        fec_sweep_results.append(
+            {
+                "rate": rate,
+                "recovered": metrics["recovered"],
+                "drops": metrics["drops"],
+            }
+        )
+
+    # =======================================================
     # SUITE 2B: HARSH LOSS + BATCH DELIVERY
     # =======================================================
     harsh_drop_in = "0.35"
@@ -563,13 +610,13 @@ def main():
 
     for name, m in results.items():
         outcome = "PASS"
-        if "FEC_0.2" in name and m["recovered"] < len(messages):
+        target = m.get("expected", len(messages))
+        if "FEC_0.2" in name and m["recovered"] < target:
             outcome = "EXPECTED FAIL (Too much loss)"
-        elif "FEC_0.5" in name:
-            target = len(messages)
-            outcome = "PASS" if m["recovered"] >= target else "UNSTABLE"
         elif "Cloudflare" in name:
-            outcome = "PASS" if m["recovered"] >= len(messages) else "UNSTABLE"
+            outcome = "PASS" if m["recovered"] >= target else "UNSTABLE"
+        elif "FEC" in name:
+            outcome = "PASS" if m["recovered"] >= target else "UNSTABLE"
         elif "Stealth" in name:
             outcome = "STABLE"
         print(
@@ -583,10 +630,70 @@ def main():
         print(f"{row[0]:<5} | {row[1]:<7} | {row[2]:<8} | {row[3]:<7} | {row[4]:<8}")
 
     print("-" * 70)
+    print(f"FEC RATE SWEEP (drop_in={loss_severe}, drop_out=0.00):")
+    for entry in fec_sweep_results:
+        print(
+            f"Rate {entry['rate']:.2f} | Rec {entry['recovered']:<3} | Drops {entry['drops']:<3}"
+        )
+
+    print("-" * 70)
     print("THROUGHPUT OVERHEAD (FEC 0.5 vs Legacy):")
     print(f"Legacy Time: {t_legacy:.2f}s")
     print(f"FEC Time:    {t_fec:.2f}s")
     print(f"Overhead:    {((t_fec - t_legacy) / t_legacy) * 100:.1f}%")
+
+    report_path = os.path.join("playground", "data", "latest_report.json")
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+    report_cases = {
+        name: {key: int(value) for key, value in metrics.items()}
+        for name, metrics in results.items()
+    }
+
+    loss_sweep_report = [
+        {
+            "loss": float(entry[0]),
+            "legacy": {"recovered": entry[1], "drops": entry[2]},
+            "fec": {"recovered": entry[3], "drops": entry[4]},
+        }
+        for entry in sweep_data
+    ]
+
+    fec_sweep_report = [
+        {
+            "rate": entry["rate"],
+            "recovered": entry["recovered"],
+            "drops": entry["drops"],
+        }
+        for entry in fec_sweep_results
+    ]
+
+    report_payload = {
+        "timestamp": time.time(),
+        "messages": messages,
+        "expected_count": expected_count,
+        "cases": report_cases,
+        "loss_sweep": loss_sweep_report,
+        "fec_rate_sweep": {
+            "drop_in": float(loss_severe),
+            "drop_out": 0.0,
+            "results": fec_sweep_report,
+        },
+        "harsh_loss_config": {
+            "drop_in": float(harsh_drop_in),
+            "drop_out": float(harsh_drop_out),
+            "grace_period": float(harsh_grace),
+        },
+        "throughput": {
+            "legacy_time": t_legacy,
+            "fec_time": t_fec,
+        },
+    }
+
+    with open(report_path, "w") as report_file:
+        json.dump(report_payload, report_file, indent=2)
+
+    print(f"[*] Report saved to {report_path}")
 
 
 if __name__ == "__main__":

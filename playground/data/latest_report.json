@@ -1,0 +1,218 @@
+{
+  "timestamp": 1766218405.00815,
+  "messages": [
+    "Meet at dawn by the old pier.",
+    "Supplies arrived safely at warehouse three.",
+    "Signal again if the plan changes before nightfall.",
+    "The package is hidden beneath the loose floorboard.",
+    "Await confirmation before advancing to the checkpoint.",
+    "Use the east tunnel if the west gate is blocked.",
+    "Switch to channel seven when the clock strikes noon.",
+    "Deliver the documents to the second courier at dusk.",
+    "Circle twice around the plaza before heading north.",
+    "Burn the notes once the rendezvous is complete."
+  ],
+  "expected_count": 10,
+  "cases": {
+    "01_Stealth_Cloudflare_NoLoss": {
+      "recovered": 10,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 0,
+      "expected": 10
+    },
+    "02_Stealth_Cloudflare_Drops": {
+      "recovered": 10,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 0,
+      "expected": 10
+    },
+    "03_FEC_0.2_vs_25Loss": {
+      "recovered": 4,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 6,
+      "expected": 10
+    },
+    "04_FEC_0.5_vs_25Loss": {
+      "recovered": 4,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 6,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.30": {
+      "recovered": 5,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 5,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.40": {
+      "recovered": 4,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 6,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.50": {
+      "recovered": 4,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 6,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.60": {
+      "recovered": 4,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 6,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.70": {
+      "recovered": 3,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 7,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.80": {
+      "recovered": 5,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 5,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.90": {
+      "recovered": 3,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 7,
+      "expected": 10
+    },
+    "04_Legacy_vs_35Loss_Bidir": {
+      "recovered": 2,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 8,
+      "expected": 10
+    },
+    "05_FEC_0.5_vs_35Loss_Bidir": {
+      "recovered": 3,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 7,
+      "expected": 10
+    }
+  },
+  "loss_sweep": [
+    {
+      "loss": 0.0,
+      "legacy": {
+        "recovered": 10,
+        "drops": 0
+      },
+      "fec": {
+        "recovered": 8,
+        "drops": 2
+      }
+    },
+    {
+      "loss": 0.1,
+      "legacy": {
+        "recovered": 7,
+        "drops": 3
+      },
+      "fec": {
+        "recovered": 4,
+        "drops": 6
+      }
+    },
+    {
+      "loss": 0.2,
+      "legacy": {
+        "recovered": 6,
+        "drops": 4
+      },
+      "fec": {
+        "recovered": 5,
+        "drops": 5
+      }
+    },
+    {
+      "loss": 0.3,
+      "legacy": {
+        "recovered": 4,
+        "drops": 6
+      },
+      "fec": {
+        "recovered": 1,
+        "drops": 9
+      }
+    }
+  ],
+  "fec_rate_sweep": {
+    "drop_in": 0.25,
+    "drop_out": 0.0,
+    "results": [
+      {
+        "rate": 0.3,
+        "recovered": 5,
+        "drops": 5
+      },
+      {
+        "rate": 0.4,
+        "recovered": 4,
+        "drops": 6
+      },
+      {
+        "rate": 0.5,
+        "recovered": 4,
+        "drops": 6
+      },
+      {
+        "rate": 0.6,
+        "recovered": 4,
+        "drops": 6
+      },
+      {
+        "rate": 0.7,
+        "recovered": 3,
+        "drops": 7
+      },
+      {
+        "rate": 0.8,
+        "recovered": 5,
+        "drops": 5
+      },
+      {
+        "rate": 0.9,
+        "recovered": 3,
+        "drops": 7
+      }
+    ]
+  },
+  "harsh_loss_config": {
+    "drop_in": 0.35,
+    "drop_out": 0.15,
+    "grace_period": 5.0
+  },
+  "throughput": {
+    "legacy_time": 17.532357931137085,
+    "fec_time": 17.532630920410156
+  }
+}
