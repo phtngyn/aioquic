@@ -143,10 +143,10 @@ class TestHarness:
         client_input=None,
         client_input_keep_open=False,
         duration=15,
+        expected_messages=None,
     ):
         print(f"\n=== RUNNING: {test_name} ===")
         logs_dir = "playground/logs"
-        os.makedirs(logs_dir, exist_ok=True)
         server_log = f"{logs_dir}/{test_name}_server.log"
         shim_log = f"{logs_dir}/{test_name}_shim.log"
         client_log = f"{logs_dir}/{test_name}_client.log"
@@ -197,10 +197,15 @@ class TestHarness:
 
         # 5. Report
         metrics = self.parse_server_metrics(server_log)
+        if expected_messages is not None:
+            metrics["expected"] = expected_messages
+            estimated_drops = max(expected_messages - metrics["recovered"], 0)
+            if estimated_drops > metrics["drops"]:
+                metrics["drops"] = estimated_drops
+
         print(
             f"    [-] Results: Recov={metrics['recovered']} | Fail={metrics['decrypt_failures']} | Gaps={metrics['gaps']} | Drops={metrics['drops']}"
         )
-
         # --- DEBUG: IF FAILED, SHOW LOGS (Ignore Stealth tests) ---
         if metrics["recovered"] == 0 and "Stealth" not in test_name:
             print("    [!] ERROR: 0 Messages recovered. Checking logs for crashes...")
@@ -232,24 +237,24 @@ def main():
     results = {}
 
     print("[*] Generating payloads (Resized for burst limits)...")
-    base_messages = [
+    messages = [
         "Meet at dawn by the old pier.",
         "Supplies arrived safely at warehouse three.",
         "Signal again if the plan changes before nightfall.",
+        "The package is hidden beneath the loose floorboard.",
+        "Await confirmation before advancing to the checkpoint.",
+        "Use the east tunnel if the west gate is blocked.",
+        "Switch to channel seven when the clock strikes noon.",
+        "Deliver the documents to the second courier at dusk.",
+        "Circle twice around the plaza before heading north.",
+        "Burn the notes once the rendezvous is complete.",
     ]
-    batch_messages = base_messages + [
-        "Extraction delayed until further notice.",
-        "Hold position until you receive the green flare.",
-    ]
-
-    payload_small = base_messages[0]
-    payload_fec = base_messages[1]
-    payload_heavy = " ".join(batch_messages)  # still well under burst + FEC limits
+    expected_count = len(messages)
 
     # Input for interactive tests
-    input_mixed = "".join(f"m:{msg}\n" for msg in base_messages) + "q\n"
-    input_batch = "".join(f"m:{msg}\n" for msg in batch_messages) + "q\n"
-    input_stealth = "".join(f"m:{msg}\n" for msg in base_messages)
+    inputs = "".join(f"m:{msg}\n" for msg in messages)
+    input_mixed = inputs + "q\n"
+    input_stealth = inputs
 
     # =======================================================
     # SUITE 1: TRAFFIC SHAPING (Stealth Stability)
@@ -278,6 +283,7 @@ def main():
         client_input=input_stealth,
         client_input_keep_open=True,
         duration=20,
+        expected_messages=expected_count,
     )
 
     results["02_Stealth_Cloudflare_Drops"] = harness.run_test(
@@ -308,6 +314,7 @@ def main():
         client_input=input_stealth,
         client_input_keep_open=True,
         duration=22,
+        expected_messages=expected_count,
     )
 
     # =======================================================
@@ -340,6 +347,7 @@ def main():
         ],
         client_input=input_mixed,
         duration=15,
+        expected_messages=expected_count,
     )
 
     results["04_FEC_0.5_vs_25Loss"] = harness.run_test(
@@ -367,6 +375,7 @@ def main():
         ],
         client_input=input_mixed,
         duration=15,
+        expected_messages=expected_count,
     )
 
     # =======================================================
@@ -402,8 +411,9 @@ def main():
             "--metrics-log-interval",
             DEFAULT_LOG_INTERVAL,
         ],
-        client_input=input_batch,
+        client_input=input_mixed,
         duration=20,
+        expected_messages=expected_count,
     )
 
     results["05_FEC_0.5_vs_35Loss_Bidir"] = harness.run_test(
@@ -436,8 +446,9 @@ def main():
             "--metrics-log-interval",
             DEFAULT_LOG_INTERVAL,
         ],
-        client_input=input_batch,
+        client_input=input_mixed,
         duration=20,
+        expected_messages=expected_count,
     )
 
     # =======================================================
@@ -469,11 +480,11 @@ def main():
                 DEFAULT_WINDOW_DEPTH,
                 "--metrics-log-interval",
                 DEFAULT_LOG_INTERVAL,
-                "--message",
-                payload_small,
             ],
             shim_args=["--drop-in", loss],
+            client_input=input_mixed,
             duration=12,
+            expected_messages=expected_count,
         )
 
         # FEC 0.3 Test
@@ -498,11 +509,11 @@ def main():
                 DEFAULT_WINDOW_DEPTH,
                 "--metrics-log-interval",
                 DEFAULT_LOG_INTERVAL,
-                "--message",
-                payload_fec,
             ],
             shim_args=["--drop-in", loss],
+            client_input=input_mixed,
             duration=12,
+            expected_messages=expected_count,
         )
         sweep_data.append(
             (
@@ -525,9 +536,11 @@ def main():
     harness.run_test(
         "Perf_Legacy",
         server_args=["--covert-strategy", "legacy"],
-        client_args=["--covert-strategy", "legacy", "--message", payload_heavy],
+        client_args=["--covert-strategy", "legacy"],
         shim_args=None,
+        client_input=input_mixed,
         duration=15,
+        expected_messages=expected_count,
     )
     t_legacy = time.time() - t0
 
@@ -535,16 +548,11 @@ def main():
     harness.run_test(
         "Perf_FEC_0.5",
         server_args=["--covert-strategy", "fec", "--fec-rate", "0.5"],
-        client_args=[
-            "--covert-strategy",
-            "fec",
-            "--fec-rate",
-            "0.5",
-            "--message",
-            payload_heavy,
-        ],
+        client_args=["--covert-strategy", "fec", "--fec-rate", "0.5"],
         shim_args=None,
+        client_input=input_mixed,
         duration=15,
+        expected_messages=expected_count,
     )
     t_fec = time.time() - t0
 
@@ -555,13 +563,13 @@ def main():
 
     for name, m in results.items():
         outcome = "PASS"
-        if "FEC_0.2" in name and m["recovered"] < len(base_messages):
+        if "FEC_0.2" in name and m["recovered"] < len(messages):
             outcome = "EXPECTED FAIL (Too much loss)"
         elif "FEC_0.5" in name:
-            target = len(batch_messages) if "35Loss" in name else len(base_messages)
+            target = len(messages)
             outcome = "PASS" if m["recovered"] >= target else "UNSTABLE"
         elif "Cloudflare" in name:
-            outcome = "PASS" if m["recovered"] >= len(base_messages) else "UNSTABLE"
+            outcome = "PASS" if m["recovered"] >= len(messages) else "UNSTABLE"
         elif "Stealth" in name:
             outcome = "STABLE"
         print(
