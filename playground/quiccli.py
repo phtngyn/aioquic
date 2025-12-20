@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import socket
 import threading
 import time
 from urllib.parse import urlparse
@@ -21,8 +22,8 @@ class TrafficShaper:
     def __init__(self, mode="cloudflare"):
         self.mode = mode
         if mode == "cloudflare":
-            self.mu = -11.4994
-            self.sigma = 2.8917
+            self.mu = -11.2251
+            self.sigma = 2.8571
             self.min_interval = 0.000001
         elif mode == "none":
             self.min_interval = 0
@@ -88,35 +89,68 @@ class QuiCCli:
         peer_meta["next_sequence"] = (seq + 1) % modulo
         return seq
 
+    def make_fake_quic_packet(self):
+        header = b"\xc0\x00\x00\x00\x01"  # Type + Version
+        dcid = os.urandom(20)
+        header += b"\x14" + dcid  # DCID Len + DCID
+        header += b"\x00"  # SCID Len
+        header += b"\x00"  # Token Len
+        header += b"\x44\xb0"  # Length (~1200 encoded as 2-byte varint)
+
+        # Fill the rest with random noise
+        payload = os.urandom(1200 - len(header))
+        return header + payload
+
     def _start_traffic_loop(self):
+        # Prepare a raw socket for "Fast Chaff" injection
+        try:
+            addr_info = socket.getaddrinfo(
+                self.host_ip, self.host_port, type=socket.SOCK_DGRAM
+            )
+            family, socktype, proto, _, sockaddr = addr_info[0]
+            raw_sock = socket.socket(family, socktype, proto)
+        except Exception as e:
+            logger.error(f"Failed to create raw socket for shaper: {e}")
+            return
+
         def _loop():
             logger.info(f"Traffic shaper started (Mode: {self.shaper_mode})")
+
             while not self._stop_event.is_set():
-                # 1. Wait for the next "natural" packet time
+                # 1. Get the target interval
                 sleep_time = self.shaper.next_interval()
+
+                # 2. Precision Wait Logic
                 if sleep_time > 0:
-                    deadline = time.monotonic() + sleep_time
-                    while not self._stop_event.is_set():
-                        remaining = deadline - time.monotonic()
+                    start = time.perf_counter()
+                    target = start + sleep_time
+
+                    while True:
+                        now = time.perf_counter()
+                        remaining = target - now
                         if remaining <= 0:
                             break
-                        time.sleep(min(0.1, remaining))
+                        if remaining > 0.001:
+                            time.sleep(remaining - 0.001)
+                        else:
+                            pass  # Busy wait
 
                 peer_meta = PEER_META.get(self.peer_key)
                 if not peer_meta:
                     continue
 
-                # 2. Check Queue State
+                # 3. Fast Chaff vs Real Message
                 if peer_meta["cid_queue"].empty():
-                    # Chaff: Send random CID to maintain cover
-                    dummy_cid = os.urandom(20)
-                    peer_meta["cid_queue"].put(dummy_cid)
-
-                # 3. Send exactly ONE packet (connection) per interval
-                # This ensures the wire traffic matches the shaper's IAT exactly.
-                self.send_message(1)
+                    try:
+                        packet = self.make_fake_quic_packet()
+                        raw_sock.sendto(packet, sockaddr)
+                    except OSError:
+                        pass
+                else:
+                    self.send_message(1)
 
             logger.info("Traffic shaper stopped")
+            raw_sock.close()
 
         self._traffic_thread = threading.Thread(target=_loop, name="quic-shaper")
         self._traffic_thread.start()

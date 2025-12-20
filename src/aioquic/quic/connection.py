@@ -1873,7 +1873,7 @@ class QuicConnection:
                 #     "ALPN negotiated protocol %s", self.tls.alpn_negotiated
                 # )
         else:
-            self._logger.info(
+            self._logger.debug(
                 "Duplicate CRYPTO data received for epoch %s", context.epoch
             )
 
@@ -2108,6 +2108,7 @@ class QuicConnection:
                 peer_meta["buffer_timestamp"] = now_ts
 
             buffer_age = now_ts - peer_meta["buffer_timestamp"]
+            # Auto-flush if buffer is too old or too big (Catastrophic recovery)
             if buffer_age > MAX_BUFFER_AGE or len(peer_meta["buffer"]) > 512:
                 logger.warning(
                     "Resetting buffer for %s (age=%.1fs, len=%d) - Timeout/Overflow",
@@ -2138,7 +2139,7 @@ class QuicConnection:
                     peer_meta["buffer"] = []
                     logger.info(f"Received public key from {peer_ip}")
 
-            # --- Data Processing (Loop to Drain Buffer) ---
+            # --- Data Processing (Scanning Loop) ---
             else:
                 metrics = peer_meta.get("metrics")
                 if metrics is None:
@@ -2150,60 +2151,71 @@ class QuicConnection:
                         "buffer_flushes": 0,
                         "sliding_window_hits": 0,
                     }
-                max_retries = max(
-                    0, getattr(self._configuration, "covert_window_depth", 5)
-                )
+
                 metrics_interval = max(
                     1, getattr(self._configuration, "covert_log_interval", 10)
                 )
-                retry_attempts = 0
-                while True:
-                    sequence = None
-                    decrypted_payload = None
-                    encrypted_payload = None
-                    decoded_msg_id = None
-                    using_sliding_window = False
 
-                    # 1. Attempt Reconstruct
+                # Scan limit: How deep to search for a valid start?
+                # 5 is enough to skip a few garbage packets without burning CPU.
+                scan_depth = getattr(self._configuration, "covert_window_depth", 5)
+
+                # We loop to process multiple messages if they arrived in a batch,
+                # OR to scan past garbage.
+                current_buffer_idx = 0
+
+                while current_buffer_idx < len(peer_meta["buffer"]):
+                    # If we are in FEC mode, we don't need sliding window scan
+                    # because FEC handles partial/loss internally.
                     if self._configuration.covert_strategy == "fec":
-                        if not peer_meta["buffer"]:
+                        # FEC Logic (Standard)
+                        remaining_buffer = peer_meta["buffer"][current_buffer_idx:]
+                        if not remaining_buffer:
                             break
 
-                        # Peek check
-                        sample = peer_meta["buffer"][0]
-                        if len(sample) < 4:
-                            peer_meta["buffer"] = []
-                            break
+                        # Quick peek check
+                        if len(remaining_buffer[0]) < 4:
+                            # Bad packet in FEC mode -> Just drop it
+                            current_buffer_idx += 1
+                            continue
 
                         result = ccrypto.reconstruct_payload_fec(
-                            peer_meta["buffer"], self._configuration.covert_fec_rate
+                            remaining_buffer, self._configuration.covert_fec_rate
                         )
 
                         if result and isinstance(result, tuple):
                             encrypted_payload, decoded_msg_id = result
-                            # Smart Clear: Remove ONLY shards for this message ID immediately
+                            # Smart Clear: We must remove the used packets from the REAL buffer
+                            # This is complex in a loop, so we filter the main buffer directly and restart
                             peer_meta["buffer"] = [
                                 pkt
                                 for pkt in peer_meta["buffer"]
                                 if len(pkt) >= 4 and pkt[0] != decoded_msg_id
                             ]
+                            # Restart scan since buffer changed
+                            current_buffer_idx = 0
                         else:
-                            # No complete message found yet -> Stop looping
+                            # No complete message found
                             break
+
+                    # Legacy Mode: We scan for a valid start point
                     else:
-                        # Legacy Mode (No Loop supported)
-                        if not peer_meta["buffer"]:
+                        # Try to decrypt assuming message starts at `current_buffer_idx`
+                        candidate_buffer = peer_meta["buffer"][current_buffer_idx:]
+                        if not candidate_buffer:
                             break
+
                         encrypted_payload = ccrypto.reconstruct_payload(
-                            peer_meta["buffer"]
+                            candidate_buffer
                         )
-                        # CRITICAL FIX: Do NOT clear buffer here for Legacy.
-                        # Wait until decryption succeeds.
 
                     if not encrypted_payload:
                         break
 
                     # 2. Decrypt
+                    decrypted_payload = None
+                    sequence = None
+
                     # Try session key first (Fast Path)
                     if peer_meta.get("session_key"):
                         decrypted = ccrypto.decrypt_with_session_key(
@@ -2215,10 +2227,13 @@ class QuicConnection:
                             )
                             decrypted_payload = decrypted[SEQUENCE_BYTES:]
 
-                    # Fallback Logic
+                    # Fallback Logic (FEC inline or RSA)
                     if decrypted_payload is None:
                         if self._configuration.covert_strategy == "fec":
-                            # Inline RSA for FEC payload (since helpers expect buffer)
+                            # (FEC decryption logic omitted for brevity, same as before)
+                            # ...
+                            # Since we handled FEC above, this block is rarely reached unless
+                            # reconstruction succeeded but decrypt failed.
                             try:
                                 iv = encrypted_payload[:AES_BLOCK_SIZE]
                                 encrypted_aes_key = encrypted_payload[
@@ -2260,41 +2275,43 @@ class QuicConnection:
                             except Exception:
                                 pass
                         else:
-                            # Legacy RSA Fallback (uses buffer)
+                            # Legacy RSA Fallback
+                            # Note: We use candidate_buffer (sliced), not full buffer
                             result = ccrypto.try_decrypt_with_sequence(
                                 peer_meta["private_key"],
-                                peer_meta["buffer"],  # Use actual buffer
+                                candidate_buffer,
                                 raise_on_error=False,
                             )
                             if result:
                                 decrypted_payload, sequence = result
                             else:
-                                if (
-                                    max_retries > 0
-                                    and retry_attempts < max_retries
-                                    and len(peer_meta["buffer"]) > 1
-                                ):
-                                    if metrics is not None:
-                                        metrics["decryption_failures"] += 1
-                                    peer_meta["buffer"].pop(0)
-                                    retry_attempts += 1
-                                    using_sliding_window = True
-                                    continue
                                 result_noseq = ccrypto.try_decrypt(
                                     peer_meta["private_key"],
-                                    peer_meta["buffer"],
+                                    candidate_buffer,
                                     raise_on_error=False,
                                 )
                                 if result_noseq:
                                     decrypted_payload = result_noseq
                                     sequence = None
 
-                    # 3. Process Message
+                    # 3. Decision Time
                     if decrypted_payload is not None:
-                        # Legacy Mode: If we are here, decryption succeeded. NOW clear buffer.
+                        # SUCCESS!
+                        # We found a message starting at `current_buffer_idx`.
+                        # 1. If idx > 0, we skipped garbage. Log it.
+                        if current_buffer_idx > 0:
+                            if metrics:
+                                metrics["decryption_failures"] += current_buffer_idx
+                                metrics["sliding_window_hits"] += 1
+
+                        # 2. Update buffer:
+                        # In Legacy mode, a success consumes the REST of the buffer.
+                        # (Because we don't know where the message ends in the stream,
+                        # we assume the whole buffer was the message).
                         if self._configuration.covert_strategy != "fec":
                             peer_meta["buffer"] = []
 
+                        # 3. Process the message (Same as before)
                         valid_seq = True
                         if sequence is not None:
                             expected = peer_meta.get("expected_sequence", 0)
@@ -2323,12 +2340,8 @@ class QuicConnection:
                                 peer_meta["sync_lost"] = False
 
                         if valid_seq:
-                            sliding_used = retry_attempts > 0
-                            retry_attempts = 0
                             if metrics is not None:
                                 metrics["msgs_recovered"] += 1
-                                if sliding_used:
-                                    metrics["sliding_window_hits"] += 1
                                 if (
                                     metrics_interval > 0
                                     and metrics["msgs_recovered"] % metrics_interval
@@ -2387,15 +2400,24 @@ class QuicConnection:
                                     session_key=peer_meta.get("session_key"),
                                     fec_rate=fec_rate,
                                 )
-                    else:
-                        if metrics is not None:
-                            metrics["decryption_failures"] += 1
-                        break
 
-                    if self._configuration.covert_strategy != "fec":
-                        # In Legacy mode, if we didn't decrypt, we keep the buffer and break.
-                        # If we did decrypt, we cleared the buffer and break.
-                        break
+                        # Done processing this message.
+                        # In Legacy mode, we break because buffer is cleared.
+                        if self._configuration.covert_strategy != "fec":
+                            break
+
+                    else:
+                        # Decryption FAILED for this candidate.
+                        # Increment index to try the next start position (Peeking).
+                        current_buffer_idx += 1
+
+                        # Stop if we've searched too deep (prevent CPU exhaustion)
+                        # or if we ran out of buffer.
+                        if current_buffer_idx > scan_depth:
+                            # We scanned `scan_depth` packets and found nothing valid.
+                            # We do NOT drop the buffer yet. We wait for more packets to arrive.
+                            # This preserves partial fragments (e.g. packet 1 of 3).
+                            break
 
         if PEER_META_LOCK.locked():
             PEER_META[peer_key] = peer_meta
