@@ -17,3 +17,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Covert channel implementation files
+*.bin
+playground/ssl_*.pem
+diff.patch
+Whitepaper.md
+playground/logs

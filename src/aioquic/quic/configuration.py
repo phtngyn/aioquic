@@ -38,6 +38,32 @@ class QuicConfiguration:
     The length in bytes of local connection IDs.
     """
 
+    covert_strategy: str = "legacy"
+    """
+    Covert channel mode. "legacy" keeps existing behavior, "fec" enables
+    small-message FEC with RS parity.
+    """
+
+    covert_fec_rate: float = 0.30
+    """
+    Redundancy rate for FEC parity when `covert_strategy` is "fec".
+    """
+
+    covert_fec_timeout: float = 5.0
+    """
+    Seconds to wait for missing shards before giving up in FEC mode.
+    """
+
+    covert_window_depth: int = 25
+    """
+    Maximum number of legacy shards to drop during passive sync recovery.
+    """
+
+    covert_log_interval: int = 10
+    """
+    Emit covert metrics every N recovered messages.
+    """
+
     idle_timeout: float = 60.0
     """
     The idle timeout in seconds.

