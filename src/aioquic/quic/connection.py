@@ -2081,7 +2081,11 @@ class QuicConnection:
                 -1 * CID_HISTORY_LENGTH :
             ]
 
-            peer_meta["buffer"].append(connection_id)
+            if self._configuration.covert_strategy == "fec":
+                peer_meta["buffer"].append(connection_id)
+            else:
+                if len(connection_id) <= 16:
+                    peer_meta["buffer"].append(connection_id)
 
             now_ts = time.time()
             if not peer_meta["buffer_timestamp"]:

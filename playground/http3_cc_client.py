@@ -424,7 +424,9 @@ if __name__ == "__main__":
         connection_id_length=20,
     )
     configuration.covert_strategy = args.covert_strategy
-    configuration.covert_fec_rate = args.fec_rate
+    configuration.covert_fec_rate = (
+        args.fec_rate if args.covert_strategy == "fec" else 0
+    )
     configuration.covert_fec_timeout = args.fec_timeout
     configuration.load_verify_locations(str(cert_path))
     configuration.traffic_shaper_mode = args.traffic_shaper_mode

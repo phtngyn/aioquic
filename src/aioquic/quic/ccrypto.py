@@ -9,6 +9,7 @@ from functools import lru_cache
 from random import shuffle
 from typing import List, Optional, Tuple
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -267,14 +268,13 @@ def decode_public_key_payload(payload: bytes) -> Optional[bytes]:
     return unmasked[HANDSHAKE_HEADER_SIZE:]
 
 
-def reconstruct_payload(buffer):
-    payload_pairs = [(v[:4], v[4:]) for v in buffer]
-    sort_index = 0
-    payload_index = 1
-    payload_chunks = [
-        v[payload_index] for v in sorted(payload_pairs, key=lambda x: x[sort_index])
-    ]
-    return b"".join(payload_chunks)
+def reconstruct_payload(buffer: List[bytes]) -> bytes:
+    """
+    Reassemble payload from chunks.
+    """
+    if not buffer:
+        return b""
+    return b"".join(buffer)
 
 
 def reconstruct_payload_fec(
@@ -297,18 +297,41 @@ def encrypt_with_session_key(session_key: bytes, message: bytes) -> bytes:
 
 
 def decrypt_with_session_key(session_key: bytes, encrypted: bytes) -> Optional[bytes]:
+    # 1. Validation Checks
+    if len(session_key) != CHACHA20_KEY_SIZE:
+        logger.error(f"Decryption Error: Invalid key size {len(session_key)}")
+        return None
+
+    if len(encrypted) <= CHACHA20_NONCE_SIZE:
+        logger.debug(f"Decryption Error: Ciphertext too short ({len(encrypted)} bytes)")
+        return None
+
+    nonce = encrypted[:CHACHA20_NONCE_SIZE]
+    ciphertext = encrypted[CHACHA20_NONCE_SIZE:]
+
+    # 2. Decryption Attempt
     try:
-        if len(session_key) != CHACHA20_KEY_SIZE:
-            raise ValueError("ChaCha20-Poly1305 requires 32-byte key")
-        if len(encrypted) <= CHACHA20_NONCE_SIZE:
-            return None
-        nonce = encrypted[:CHACHA20_NONCE_SIZE]
-        ciphertext = encrypted[CHACHA20_NONCE_SIZE:]
         cipher = ChaCha20Poly1305(session_key)
+        # Assuming cipher.decrypt returns bytes on success, raises InvalidTag on failure
         compressed_message = cipher.decrypt(nonce, ciphertext, None)
-        return zlib.decompress(compressed_message)
+    except InvalidTag:
+        # This implies the Key is wrong, or the Nonce is wrong, or Data is corrupted
+        logger.debug(
+            f"Session key decryption failed: Integrity check failed (InvalidTag). Len: {len(encrypted)}"
+        )
+        return None
     except Exception as e:
-        logger.debug(f"Session key decryption failed: {e}")
+        logger.error(f"Session key decryption failed: Crypto library error: {e}")
+        return None
+
+    # 3. Decompression Attempt
+    try:
+        return zlib.decompress(compressed_message)
+    except zlib.error as e:
+        # This implies Decryption WORKED, but the payload is not valid zlib data
+        logger.error(f"Session key decryption success, but ZLIB failed: {e}")
+        # useful debugging: print hex of compressed_message to see if it looks like garbage
+        logger.debug(f"Bad Zlib Payload (hex): {compressed_message.hex()}")
         return None
 
 
@@ -317,13 +340,6 @@ def parse_public_key_chunks(chunks: List[bytes]) -> Optional[bytes]:
         return None
     payload = reconstruct_payload(chunks)
     return decode_public_key_payload(payload)
-
-
-def generate_ordered_bytes(n, size=4):
-    prefixes = set()
-    while len(prefixes) < n:
-        prefixes.add(os.urandom(size))
-    return sorted(list(prefixes))
 
 
 def queue_message(
@@ -358,18 +374,14 @@ def queue_message(
         fec_rate = None
 
     if fec_rate and fec_rate > 0:
-        # Pass session_key for Header Obfuscation
+        # FEC Mode
         cid_payloads = fec_encode(target_payload, fec_rate, session_key=session_key)
     else:
-        # Legacy Mode (Vulnerable to Prefix Leak - Recommended to use FEC)
+        # Legacy Mode
         chunk_size = 16
-        raw_chunks = [
+        cid_payloads = [
             target_payload[i : i + chunk_size]
             for i in range(0, len(target_payload), chunk_size)
-        ]
-        cid_payloads = [
-            v[0] + v[1]
-            for v in zip(generate_ordered_bytes(len(raw_chunks)), raw_chunks)
         ]
 
     if len(cid_payloads) > MAX_CID_BURST:
@@ -378,7 +390,9 @@ def queue_message(
         )
         return 0
 
-    shuffle(cid_payloads)
+    if fec_rate and fec_rate > 0:
+        shuffle(cid_payloads)
+
     if is_public_key:
         logger.debug(
             "Handshake chunks lens=%s total=%d hex=%s",
@@ -386,7 +400,9 @@ def queue_message(
             len(target_payload),
             [v.hex() for v in cid_payloads],
         )
+
     for cid in cid_payloads:
         queue.put(cid)
+
     logger.debug(f"Queued {len(cid_payloads)} chunks (FEC={bool(fec_rate)})")
     return len(cid_payloads)
