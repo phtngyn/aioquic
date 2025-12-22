@@ -1,5 +1,5 @@
 {
-  "timestamp": 1766258806.141008,
+  "timestamp": 1766403500.701013,
   "messages": [
     "Meet at dawn by the old pier.",
     "Supplies arrived safely at warehouse three.",
@@ -16,7 +16,7 @@
   "cases": {
     "01_Stealth_Cloudflare_NoLoss": {
       "recovered": 10,
-      "decrypt_failures": 4,
+      "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
       "drops": 0,
@@ -47,14 +47,6 @@
       "expected": 10
     },
     "05_FEC_Sweep_0.30": {
-      "recovered": 6,
-      "decrypt_failures": 0,
-      "gaps": 0,
-      "flushes": 0,
-      "drops": 4,
-      "expected": 10
-    },
-    "05_FEC_Sweep_0.40": {
       "recovered": 8,
       "decrypt_failures": 0,
       "gaps": 0,
@@ -62,12 +54,20 @@
       "drops": 2,
       "expected": 10
     },
-    "05_FEC_Sweep_0.50": {
-      "recovered": 6,
+    "05_FEC_Sweep_0.40": {
+      "recovered": 5,
       "decrypt_failures": 0,
-      "gaps": 1,
+      "gaps": 0,
       "flushes": 0,
-      "drops": 4,
+      "drops": 5,
+      "expected": 10
+    },
+    "05_FEC_Sweep_0.50": {
+      "recovered": 7,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 3,
       "expected": 10
     },
     "05_FEC_Sweep_0.60": {
@@ -87,11 +87,11 @@
       "expected": 10
     },
     "05_FEC_Sweep_0.80": {
-      "recovered": 6,
+      "recovered": 7,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
-      "drops": 4,
+      "drops": 3,
       "expected": 10
     },
     "05_FEC_Sweep_0.90": {
@@ -103,19 +103,19 @@
       "expected": 10
     },
     "04_Legacy_vs_35Loss_Bidir": {
-      "recovered": 1,
-      "decrypt_failures": 25,
-      "gaps": 0,
-      "flushes": 0,
-      "drops": 9,
-      "expected": 10
-    },
-    "05_FEC_0.5_vs_35Loss_Bidir": {
-      "recovered": 7,
+      "recovered": 9,
       "decrypt_failures": 0,
       "gaps": 0,
       "flushes": 0,
-      "drops": 3,
+      "drops": 1,
+      "expected": 10
+    },
+    "05_FEC_0.5_vs_35Loss_Bidir": {
+      "recovered": 6,
+      "decrypt_failures": 0,
+      "gaps": 0,
+      "flushes": 0,
+      "drops": 4,
       "expected": 10
     }
   },
@@ -123,19 +123,19 @@
     {
       "loss": 0.0,
       "legacy": {
-        "recovered": 1,
-        "drops": 9
+        "recovered": 10,
+        "drops": 0
       },
       "fec": {
-        "recovered": 8,
-        "drops": 2
+        "recovered": 9,
+        "drops": 1
       }
     },
     {
       "loss": 0.1,
       "legacy": {
-        "recovered": 1,
-        "drops": 9
+        "recovered": 10,
+        "drops": 0
       },
       "fec": {
         "recovered": 8,
@@ -145,19 +145,19 @@
     {
       "loss": 0.2,
       "legacy": {
-        "recovered": 1,
-        "drops": 9
+        "recovered": 10,
+        "drops": 0
       },
       "fec": {
-        "recovered": 7,
-        "drops": 3
+        "recovered": 5,
+        "drops": 5
       }
     },
     {
       "loss": 0.3,
       "legacy": {
-        "recovered": 1,
-        "drops": 9
+        "recovered": 9,
+        "drops": 1
       },
       "fec": {
         "recovered": 7,
@@ -171,18 +171,18 @@
     "results": [
       {
         "rate": 0.3,
-        "recovered": 6,
-        "drops": 4
-      },
-      {
-        "rate": 0.4,
         "recovered": 8,
         "drops": 2
       },
       {
+        "rate": 0.4,
+        "recovered": 5,
+        "drops": 5
+      },
+      {
         "rate": 0.5,
-        "recovered": 6,
-        "drops": 4
+        "recovered": 7,
+        "drops": 3
       },
       {
         "rate": 0.6,
@@ -196,8 +196,8 @@
       },
       {
         "rate": 0.8,
-        "recovered": 6,
-        "drops": 4
+        "recovered": 7,
+        "drops": 3
       },
       {
         "rate": 0.9,
@@ -212,7 +212,7 @@
     "grace_period": 5.0
   },
   "throughput": {
-    "legacy_time": 17.52789306640625,
-    "fec_time": 17.542609214782715
+    "legacy_time": 17.540632009506226,
+    "fec_time": 17.54225468635559
   }
 }
