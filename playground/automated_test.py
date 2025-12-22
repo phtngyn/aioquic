@@ -102,7 +102,7 @@ class TestHarness:
         with open(log_path, "r") as f:
             for line in f:
                 # 1. Fallback: Count raw success lines (since Final Report often fails on SIGTERM)
-                if "RECEIVED MESSAGE" in line:
+                if "=== RECEIVED MESSAGE" in line:
                     manual_recovery_count += 1
 
                 # 2. Parse explicit metrics reports (if available)

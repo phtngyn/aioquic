@@ -54,7 +54,7 @@ class QuicConfiguration:
     Seconds to wait for missing shards before giving up in FEC mode.
     """
 
-    covert_window_depth: int = 5
+    covert_window_depth: int = 25
     """
     Maximum number of legacy shards to drop during passive sync recovery.
     """
